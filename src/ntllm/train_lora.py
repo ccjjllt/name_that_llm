@@ -177,12 +177,16 @@ def runtime(device_name, dtype_name):
             device_name = 'mps'
     device = torch.device(device_name)
     if device.type == 'cuda':
+        if device.index is None:
+            device = torch.device('cuda', torch.cuda.current_device())
         torch.cuda.set_device(device)
     if device.type not in ('cpu', 'mps', 'cuda'):
         raise ValueError('Supported devices are cpu, mps and cuda.')
     if dtype_name == 'auto':
-        bf16 = device.type == 'mps' or (device.type == 'cuda' and torch.cuda.is_bf16_supported())
-        dtype_name = 'bfloat16' if bf16 else 'float32'
+        bf16 = device.type == 'mps' or (
+            device.type == 'cuda' and torch.cuda.get_device_capability(device)[0] >= 8
+            and torch.cuda.is_bf16_supported())
+        dtype_name = 'bfloat16' if bf16 else ('float16' if device.type == 'cuda' else 'float32')
     if device.type == 'cpu' and dtype_name != 'float32':
         raise ValueError('Use float32 for CPU training.')
     if dtype_name == 'float16' and device.type != 'cuda':
