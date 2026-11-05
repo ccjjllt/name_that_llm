@@ -1,0 +1,25 @@
+# Environments and local caches
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.DS_Store
+.ipynb_checkpoints/
+.env
+.env.*
+!.env.example
+
+# Competition data and experiment artifacts stay local
+data/*
+!data/.gitkeep
+runs/*
+!runs/.gitkeep
+*.joblib
+*.pkl
+*.pt
+*.pth
+*.safetensors
+
