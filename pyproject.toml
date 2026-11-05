@@ -18,6 +18,13 @@ explore = [
     "ipykernel>=6",
     "matplotlib>=3.8",
 ]
+lora = [
+    "torch>=2.6,<3",
+    "transformers>=4.57,<6",
+    "peft==0.20.0",
+    "accelerate>=1,<2",
+    "safetensors>=0.5,<1",
+]
 
 [build-system]
 requires = ["hatchling>=1.26"]

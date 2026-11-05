@@ -1,0 +1,40 @@
+# Confirmed q8v5 architecture. Unpublished optimizer details are project choices.
+keep = 24
+layers = [2, 4, 6, 8, 12, 16, 20, 24]
+max_len = 384
+r = 16
+alpha = 32
+lora_dropout = 0.05
+attention_implementation = "sdpa"
+gradient_checkpointing = true
+
+# Two external epochs, then two official epochs, as reported by the author.
+external_epochs = 2
+official_epochs = 2
+external_lr = 0.0001
+external_head_lr = 0.001
+official_lr = 0.00005
+official_head_lr = 0.0005
+
+# Explicit reconstruction choices, not recovered original training parameters.
+batch_size = 3
+accumulation = 6
+weight_decay = 0.01
+warmup_fraction = 0.1
+head_dropout = 0.1
+gradient_clip = 1.0
+centered_weight = 1.0
+# Controlled relation contexts across baseline/mix20 and independent class loss budgets.
+centered_plan = "shared_triplets"
+centered_balance = "class_mass"
+class_balance = true
+matching_strength = 0.5
+seed = 42
+eval_batch_size = 8
+eval_gaussian = true
+# Published query-only vocabulary fitting remains an explicit comparison arm.
+eval_grouping_protocol = "train_fold"
+eval_cluster_threshold = 0.15
+eval_cohort_seeds = [42, 43]
+device = "auto"
+dtype = "auto"
