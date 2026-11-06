@@ -30,11 +30,13 @@ def prompt_batches(frame, seed, batch_size=3):
     eligible &= groups.prompt_id.fillna("").str.strip().ne("").to_numpy()
     batches = []
     mixed = np.flatnonzero(~eligible).tolist()
+    model_values = groups.model.to_numpy()
     for positions in groups.loc[eligible].groupby("prompt_id", sort=True).groups.values():
-        part = groups.loc[positions]
+        positions = np.asarray(positions, dtype=int)
+        group_labels = model_values[positions]
         by_label = {
-            label: rng.permutation(rows.to_numpy(dtype=int)).tolist()
-            for label, rows in part.groupby("model", sort=True).groups.items()
+            label: rng.permutation(positions[group_labels == label]).tolist()
+            for label in sorted(set(group_labels))
         }
         while len(by_label) >= 2:
             labels = list(by_label)

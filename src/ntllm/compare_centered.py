@@ -31,9 +31,9 @@ def read_config(path, phase, variant, enabled):
     weight = settings["centered_weight"]
     if not np.isfinite(weight) or (weight <= 0 if enabled else weight != 0):
         raise ValueError(f"{path}: centered_weight does not match this off/on arm.")
-    if (settings.get("centered_plan") != "shared_triplets"
+    if (settings.get("centered_plan") not in ("shared_triplets", "shared_stratified_triplets")
             or settings.get("centered_balance") != "class_mass"):
-        raise ValueError(f"{path}: shared_triplets/class_mass supervision is required.")
+        raise ValueError(f"{path}: shared or shared-stratified triplets with class_mass supervision are required.")
     if not config.get("data_manifest_sha256") or not config.get("base"):
         raise ValueError(f"{path}: data manifest and base model identity are required.")
     return config

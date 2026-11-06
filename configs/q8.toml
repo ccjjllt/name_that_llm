@@ -1,4 +1,7 @@
-# Confirmed q8v5 architecture. Unpublished optimizer details are project choices.
+# Q8 共用模型与优化参数。当前实验只在文件末尾声明差异。
+# 新训练默认 auxiliary；来源数据准备默认 source；短程基准只读共用参数。
+default_experiment = "auxiliary"
+
 keep = 24
 layers = [2, 4, 6, 8, 12, 16, 20, 24]
 max_len = 384
@@ -8,33 +11,63 @@ lora_dropout = 0.05
 attention_implementation = "sdpa"
 gradient_checkpointing = true
 
-# Two external epochs, then two official epochs, as reported by the author.
 external_epochs = 2
 official_epochs = 2
 external_lr = 0.0001
 external_head_lr = 0.001
 official_lr = 0.00005
 official_head_lr = 0.0005
-
-# Explicit reconstruction choices, not recovered original training parameters.
 batch_size = 3
 accumulation = 6
 weight_decay = 0.01
 warmup_fraction = 0.1
 head_dropout = 0.1
 gradient_clip = 1.0
-centered_weight = 1.0
-# Controlled relation contexts across baseline/mix20 and independent class loss budgets.
-centered_plan = "shared_triplets"
+
+centered_plan = "shared_stratified_triplets"
 centered_balance = "class_mass"
+centered_weight = 1.0
 class_balance = true
 matching_strength = 0.5
 seed = 42
 eval_batch_size = 8
 eval_gaussian = true
-# Published query-only vocabulary fitting remains an explicit comparison arm.
 eval_grouping_protocol = "train_fold"
 eval_cluster_threshold = 0.15
 eval_cohort_seeds = [42, 43]
 device = "auto"
 dtype = "auto"
+backend = "hf"
+forward_batch_rows = 3
+optimizer = "adamw"
+fused_adamw = false
+checkpoint_keep = 2
+require_shared_initialization = true
+
+# 固定 baseline 的关系文本，仅替换 plain-only 槽；保留原来源对照条件。
+[experiments.source]
+centered_plan = "anchored_triplets"
+
+# 扩展池完整两轮的 class/global 对照；官方阶段固定。
+[experiments.auxiliary]
+centered_plan = "grouped_triplets"
+research_inner_validation = true
+inner_outer_fold = 0
+inner_seed = 42
+inner_dev_fraction = 0.2
+external_snapshot_updates = [100, 500, 1000, 2000, 5000, 10000, 13242, 20000, 26484]
+snapshot_official_epochs = true
+gradient_diagnostic_updates = [1, 100, 500, 2000, 10000, 20000, 26484]
+initialization_mode = "canonical_backend"
+fusion_protocol = "calibrated_inner_v2"
+
+# --centered-balance 等覆盖只作用于当前阶段。
+[experiments.auxiliary.supervision.external]
+centered_plan = "grouped_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0
+
+[experiments.auxiliary.supervision.official]
+centered_plan = "shared_stratified_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0

@@ -1,6 +1,7 @@
 """Shared relation batches and explicit target-class auxiliary loss budgets."""
 
 import hashlib
+import json
 
 import numpy as np
 import pandas as pd
@@ -26,15 +27,16 @@ def common_relation_rows(frame, peer):
     first, second = frame.set_index("id", drop=False), peer.set_index("id", drop=False)
     ids = sorted(set(first.index) & set(second.index))
     left, right = first.loc[ids], second.loc[ids]
-    if not left[["text", "model", "prompt_id"]].equals(right[["text", "model", "prompt_id"]]):
-        raise ValueError("A shared text ID has inconsistent text, label or prompt grouping.")
+    if not left[["text", "model", "prompt_id", "word_bin"]].equals(right[["text", "model", "prompt_id", "word_bin"]]):
+        raise ValueError("A shared text ID has inconsistent text, label, prompt grouping or length bin.")
     eligible = np.ones(len(ids), dtype=bool)
     for arm in (left, right):
         column = "group_eligible" if "group_eligible" in arm else "group_is_strong"
         eligible &= arm[column].fillna(False).to_numpy(dtype=bool)
         eligible &= arm.prompt_id.fillna("").astype(str).str.strip().ne("").to_numpy()
     common = left.iloc[np.flatnonzero(eligible)].reset_index(drop=True)
-    identity = "\n".join(f"{row.id}\t{row.model}\t{row.prompt_id}" for row in common.itertuples())
+    identity = "\n".join(f"{ident}\t{label}\t{prompt}" for ident, label, prompt in
+                         zip(common.id, common.model, common.prompt_id))
     report = {
         "selection": "identical shared text/label/prompt, eligible in both arms",
         "arm_rows": len(frame), "peer_rows": len(peer), "shared_text_rows": len(ids),
@@ -46,11 +48,14 @@ def common_relation_rows(frame, peer):
     return common, report
 
 
-def shared_triplet_batches(frame, common, seed, batch_size=3):
+def shared_triplet_batches(frame, common, seed, batch_size=3, stratify_plain=False):
     """Use identical shared triplets, then cover every remaining row with plain CE.
 
     The batch-size sequence and relation positions depend only on the common
     rows, seed and total row count, so matched arms have identical window shapes.
+    stratify_plain couples each remaining slot's model/length stratum between
+    equal-quota arms, including any finite prefix. It does not enlarge the
+    shared relation set or make different protocols a text-transformation pair.
     """
     if batch_size != 3:
         raise ValueError("shared_triplets requires batch_size=3.")
@@ -62,16 +67,244 @@ def shared_triplet_batches(frame, common, seed, batch_size=3):
         raise ValueError("A shared relation text is absent from the training arm.")
     batches = []
     used = np.zeros(len(frame), dtype=bool)
+    common_positions = positions.loc[common.id].to_numpy(dtype=int)
     for rows, same in prompt_batches(common, seed, batch_size):
         if same and len(rows) == 3:
-            mapped = positions.loc[common.iloc[rows].id].to_numpy(dtype=int).tolist()
+            mapped = common_positions[rows].tolist()
             batches.append((mapped, True))
             used[mapped] = True
     rng = np.random.default_rng(seed)
-    remaining = rng.permutation(np.flatnonzero(~used)).tolist()
+    remaining = np.flatnonzero(~used)
+    if stratify_plain:
+        if not frame.word_bin.isin(WORD_BINS).all():
+            raise ValueError("Stratified plain slots require known word-count bins.")
+        # Keep within-stratum random draws separate from the historical global
+        # permutation and batch-placement RNG, preserving relation positions.
+        row_rng = np.random.default_rng(seed + 100000)
+        groups = frame.iloc[remaining].groupby(
+            ["model", "word_bin"], observed=True, sort=False).indices
+        ordered = []
+        for label in sorted(frame.model.unique()):
+            for word_bin in WORD_BINS:
+                local = groups.get((label, word_bin), np.array([], dtype=int))
+                ordered.extend(row_rng.permutation(remaining[local]).tolist())
+        remaining = np.asarray(ordered, dtype=int)
+    remaining = rng.permutation(remaining).tolist()
     batches.extend((remaining[start:start + batch_size], False)
                    for start in range(0, len(remaining), batch_size))
     return [batches[index] for index in rng.permutation(len(batches))]
+
+
+def align_anchor_rows(frame, anchor):
+    """Align immutable relation examples to a plain arm's experimental slots."""
+    if not anchor.id.is_unique or not frame.id.is_unique:
+        raise ValueError("Anchored plans require unique text IDs in each arm.")
+    if "training_slot_id" not in frame or not frame.training_slot_id.is_unique:
+        raise ValueError("Anchored arms need unique training_slot_id values.")
+    if set(frame.training_slot_id) != set(anchor.id):
+        raise ValueError("Anchored arms must cover exactly the anchor's slots.")
+    aligned = anchor.set_index("id", drop=False).loc[frame.training_slot_id].reset_index(drop=True)
+    if not frame.reset_index(drop=True)[["model", "word_bin"]].equals(aligned[["model", "word_bin"]]):
+        raise ValueError("An anchored replacement changes its slot's class or length bin.")
+    aligned["training_slot_id"] = frame.training_slot_id.to_numpy()
+    return aligned
+
+
+def anchored_triplet_batches(frame, anchor, seed, batch_size=3, permit_plain_replacement_all=False):
+    """Replay an anchor plan while allowing only plain-slot text replacements.
+
+    Class and length are fixed for every slot. By default the same forward is
+    used by both heads, so centered slots cannot change text. The explicit
+    separate-forward mode allows any plain replacement while the caller must
+    compute centered loss from aligned anchor texts, never from the changed arm.
+    """
+    align_anchor_rows(frame, anchor)
+    position = pd.Series(np.arange(len(frame), dtype=int), index=frame.training_slot_id)
+    mapped = position.loc[anchor.id].to_numpy(dtype=int)
+    aligned = frame.iloc[mapped].reset_index(drop=True)
+    anchor = anchor.reset_index(drop=True)
+    common, _ = common_relation_rows(anchor, anchor)
+    plan = shared_triplet_batches(anchor, common, seed, batch_size)
+    relation_positions = np.asarray([i for rows, same in plan if same for i in rows], dtype=int)
+    columns = ["id", "text", "model", "prompt_id"]
+    if not permit_plain_replacement_all and not aligned.iloc[relation_positions][columns].equals(anchor.iloc[relation_positions][columns]):
+        raise ValueError("An anchored replacement changes a centered text, label or prompt.")
+    return [(mapped[rows].tolist(), same) for rows, same in plan]
+
+
+def plan_evidence(frame, windows_by_epoch, plain_weights, centered_weights,
+                  max_updates=None, centered_strength=1.0, relation_frame=None):
+    """Describe actual exposure and coefficients without loading a model.
+
+    Per-slot stratum equality is stronger than equal whole-pool quotas. The
+    centered fingerprint includes window position, partners and effective
+    per-row coefficients, not just aggregate target-class loss mass.
+    """
+    labels = sorted(frame.model.unique())
+    ids = frame.id.to_numpy()
+    models = frame.model.to_numpy()
+    bins = frame.word_bin.to_numpy()
+    slots = frame.get("training_slot_id", frame.id).to_numpy()
+    relations = frame if relation_frame is None else relation_frame
+    if len(relations) != len(frame) or not relations.model.reset_index(drop=True).equals(frame.model.reset_index(drop=True)):
+        raise ValueError("Relation rows and plain targets must be aligned by experimental slot.")
+    if relation_frame is not None and not np.array_equal(relations.training_slot_id.to_numpy(), slots):
+        raise ValueError("Relation data do not match the plain arm's slot order.")
+    relation_ids, relation_prompts = relations.id.to_numpy(), relations.prompt_id.to_numpy()
+    remaining = sum(map(len, windows_by_epoch)) if max_updates is None else max_updates
+    reports = []
+
+    def describe(windows, epoch):
+        active, relation_rows = [], []
+        stratum_hash, slot_hash, text_hash, context_hash = [hashlib.sha256() for _ in range(4)]
+        coefficient_mass = {label: 0.0 for label in labels}
+        for update, chunk in enumerate(windows):
+            denominator = sum(len(rows) for rows, _ in chunk)
+            for batch, (rows, same) in enumerate(chunk):
+                positions = np.asarray(rows, dtype=int)
+                active.extend(rows)
+                for slot, i in enumerate(rows):
+                    location = [update, batch, slot, denominator, bool(same)]
+                    for digest, identity in ((stratum_hash, [models[i], bins[i]]),
+                                             (slot_hash, [slots[i]]), (text_hash, [ids[i]])):
+                        digest.update((json.dumps(location + identity, ensure_ascii=False,
+                                                  separators=(",", ":")) + "\n").encode())
+                if same:
+                    relation_rows.extend(rows)
+                    event = [update, batch, denominator, relation_ids[positions].tolist(),
+                             models[positions].tolist(), relation_prompts[positions].tolist(),
+                             (np.asarray(plain_weights)[positions] / denominator).tolist(),
+                             (centered_weights[epoch, positions] * centered_strength / denominator).tolist()]
+                    context_hash.update((json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+                    for i in rows:
+                        coefficient_mass[models[i]] += float(centered_weights[epoch, i]) * centered_strength / denominator
+        active = np.asarray(active, dtype=int)
+        relation_rows = np.asarray(relation_rows, dtype=int)
+        counts = frame.iloc[active].groupby(["model", "word_bin"], observed=True).size()
+        per_class = []
+        for label in labels:
+            per_class.append(dict(model=label, rows=int((models[active] == label).sum()),
+                                  centered_rows=int((models[relation_rows] == label).sum()),
+                                  centered_coefficient_mass=coefficient_mass[label]))
+        return dict(updates=len(windows), rows=len(active), unique_rows=len(np.unique(active)),
+                    centered_rows=len(relation_rows), centered_unique_rows=len(np.unique(relation_rows)),
+                    plain_forward_rows=len(active),
+                    additional_relation_forward_rows=(len(relation_rows) if relation_frame is not None and centered_strength > 0 else 0),
+                    total_forward_rows=(len(active) + (len(relation_rows) if relation_frame is not None and centered_strength > 0 else 0)),
+                    stratum_slot_sha256=stratum_hash.hexdigest(), anchor_slot_sha256=slot_hash.hexdigest(),
+                    text_slot_sha256=text_hash.hexdigest(),
+                    centered_context_coefficient_sha256=context_hash.hexdigest(),
+                    class_length_counts=[dict(model=label, word_bin=length, rows=int(counts.get((label, length), 0)))
+                                         for label in labels for length in WORD_BINS], per_class=per_class)
+
+    for epoch, windows in enumerate(windows_by_epoch):
+        actual = min(len(windows), max(0, remaining))
+        remaining -= actual
+        full = describe(windows, epoch)
+        selected = full if actual == len(windows) else describe(windows[:actual], epoch)
+        reports.append(dict(epoch=epoch + 1, full=full, actual=selected,
+                            full_epoch_once=full['rows'] == full['unique_rows'] == len(frame)))
+    return dict(scope="Actual requested update prefixes, with full-epoch coverage retained.",
+                relation_input="separate_anchor" if relation_frame is not None else "shared_plain_forward",
+                coefficient_note="Weights outside the requested budget are zero; full records describe layout, not an additional training budget.",
+                epochs=reports)
+
+
+def relation_coverage(frame, windows_by_epoch, max_updates=None, labels=None):
+    """Measure physical relation support, independent of auxiliary loss weights.
+
+    A group contributes each unordered label pair once. Repeated encounters of
+    the same two text IDs count toward encounters but not unique_text_pairs.
+    The per-class view also counts distinct partner texts and target texts;
+    equal loss mass cannot change any of these quantities.
+    """
+    labels = sorted(frame.model.unique()) if labels is None else list(labels)
+    if len(set(labels)) != len(labels) or not frame.model.isin(labels).all():
+        raise ValueError("Coverage labels must uniquely include every relation label.")
+    if max_updates is not None and (not isinstance(max_updates, (int, np.integer)) or max_updates < 1):
+        raise ValueError("Coverage update budget must be a positive integer.")
+    if not frame.id.is_unique:
+        raise ValueError("Physical relation coverage requires unique text IDs per frame.")
+    ids, models, prompts = (frame[column].to_numpy() for column in ("id", "model", "prompt_id"))
+    label_order = {label: index for index, label in enumerate(labels)}
+    pairs = [(left, right) for index, left in enumerate(labels) for right in labels[index + 1:]]
+
+    def new_state():
+        return dict(updates=0, groups=0, rows=0, sizes={}, fingerprint=hashlib.sha256(),
+                    classes={label: dict(exposures=0, texts=set(), prompts=set(), partner_texts=set(),
+                                         partner_labels=set(), partner_encounters=0) for label in labels},
+                    pairs={pair: dict(encounters=0, text_pairs=set(), left=set(), right=set(), prompts=set())
+                           for pair in pairs})
+
+    def add_group(state, rows, epoch, update, denominator):
+        rows = np.asarray(rows, dtype=int)
+        if (rows < 0).any() or (rows >= len(frame)).any() or len(rows) < 2:
+            raise ValueError("A relation group needs valid positions and at least two rows.")
+        if len(set(models[rows])) != len(rows) or len(set(prompts[rows])) != 1:
+            raise ValueError("Relation coverage requires one prompt and distinct labels per group.")
+        state['groups'] += 1
+        state['rows'] += len(rows)
+        state['sizes'][len(rows)] = state['sizes'].get(len(rows), 0) + 1
+        event = [epoch, update, denominator, ids[rows].tolist(), models[rows].tolist(), str(prompts[rows[0]])]
+        state['fingerprint'].update((json.dumps(event, ensure_ascii=False, separators=(',', ':')) + '\n').encode())
+        for row in rows:
+            cls = state['classes'][models[row]]
+            cls['exposures'] += 1
+            cls['texts'].add(ids[row])
+            cls['prompts'].add(prompts[row])
+            partners = rows[rows != row]
+            cls['partner_texts'].update(ids[partners])
+            cls['partner_labels'].update(models[partners])
+            cls['partner_encounters'] += len(partners)
+        for index, row in enumerate(rows):
+            for other in rows[index + 1:]:
+                left, right = (row, other) if label_order[models[row]] < label_order[models[other]] else (other, row)
+                pair = state['pairs'][(models[left], models[right])]
+                pair['encounters'] += 1
+                pair['text_pairs'].add((ids[left], ids[right]))
+                pair['left'].add(ids[left])
+                pair['right'].add(ids[right])
+                pair['prompts'].add(prompts[left])
+
+    def summary(state):
+        pair_rows = [dict(left_label=left, right_label=right, encounters=values['encounters'],
+                          unique_text_pairs=len(values['text_pairs']), unique_left_texts=len(values['left']),
+                          unique_right_texts=len(values['right']), unique_prompts=len(values['prompts']))
+                     for (left, right), values in state['pairs'].items()]
+        return dict(active_updates=state['updates'], centered_groups=state['groups'],
+                    centered_row_exposures=state['rows'],
+                    centered_unique_texts=sum(len(value['texts']) for value in state['classes'].values()),
+                    group_size_counts={str(key): value for key, value in state['sizes'].items()},
+                    relation_context_sha256=state['fingerprint'].hexdigest(),
+                    possible_label_pairs=len(pairs), observed_label_pairs=sum(row['encounters'] > 0 for row in pair_rows),
+                    pair_encounters=sum(row['encounters'] for row in pair_rows),
+                    unique_text_pairs=sum(row['unique_text_pairs'] for row in pair_rows),
+                    per_class=[dict(model=label, centered_row_exposures=value['exposures'],
+                                    centered_unique_texts=len(value['texts']), unique_prompts=len(value['prompts']),
+                                    unique_partner_texts=len(value['partner_texts']),
+                                    unique_partner_labels=len(value['partner_labels']),
+                                    partner_encounters=value['partner_encounters'])
+                               for label, value in state['classes'].items()], per_label_pair=pair_rows)
+
+    total, epochs = new_state(), []
+    remaining = sum(map(len, windows_by_epoch)) if max_updates is None else max_updates
+    for epoch, windows in enumerate(windows_by_epoch):
+        count = min(len(windows), max(0, remaining))
+        remaining -= count
+        current = new_state()
+        current['updates'] = count
+        total['updates'] += count
+        for update, chunk in enumerate(windows[:count]):
+            denominator = sum(len(rows) for rows, _ in chunk)
+            for rows, same in chunk:
+                if same:
+                    add_group(current, rows, epoch, update, denominator)
+                    add_group(total, rows, epoch, update, denominator)
+        epochs.append(dict(epoch=epoch + 1, **summary(current)))
+    return dict(scope="Actual update prefix; physical text and partner support, without loss weighting.",
+                pair_direction="Unordered distinct-label pairs; one encounter per text pair within a group.",
+                repeated_text_note="Unique text and pair counts deduplicate across epochs; exposures retain repetitions.",
+                requested_max_updates=max_updates, total=summary(total), epochs=epochs)
 
 
 def _exposure(frame, targets, plain_weights, windows, classes):

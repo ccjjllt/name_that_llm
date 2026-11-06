@@ -1,0 +1,9 @@
+-r requirements-hf.txt
+unsloth[huggingfacenotorch] @ git+https://github.com/unslothai/unsloth.git@3fc6b699e65e8c6c375c29ea4f7fa80185f1e6a0
+unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo.git@1abf1e8ac638e09a1a74b04ff1c7ff1d3e1582ee
+trl==0.24.0
+datasets==3.6.0
+diffusers==0.39.0
+sentence-transformers==5.1.2
+torchao==0.16.0
+bitsandbytes==0.50.0

@@ -1,0 +1,13 @@
+# Shared version pins live in constraints-kaggle.txt; keep installed CUDA Torch.
+-c constraints-kaggle.txt
+transformers
+peft
+accelerate
+huggingface-hub
+tokenizers
+numpy
+pandas
+scikit-learn
+scipy
+pyarrow
+safetensors

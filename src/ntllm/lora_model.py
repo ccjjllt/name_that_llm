@@ -107,7 +107,14 @@ class Q8Classifier(nn.Module):
                 getattr(self, name).load_state_dict(state)
 
     def encode(self, texts):
-        return self.tokenizer(list(texts), truncation=True, max_length=self.max_len)['input_ids']
+        # Bound the tokenizer's temporary Encoding objects for the expanded pool.
+        # Padding is still performed per physical forward, preserving token IDs.
+        texts = list(texts)
+        encoded = []
+        for start in range(0, len(texts), 2048):
+            encoded.extend(self.tokenizer(texts[start:start + 2048], truncation=True,
+                                          max_length=self.max_len, return_attention_mask=False)['input_ids'])
+        return encoded
 
     def representation(self, tokens):
         batch = self.tokenizer.pad({'input_ids': tokens}, return_tensors='pt').to(self.device)
