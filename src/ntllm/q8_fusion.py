@@ -24,6 +24,12 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def inference_core_options(options):
+    """Stress membership may vary; grouping and Gaussian inference must stay fixed."""
+    return {key: value for key, value in options.items()
+            if key not in ('seeds', 'eval_cohorts', 'imbalance_suite')}
+
+
 def candidate_recipes(allow_exclusion=False):
     """Eleven preregistered weights; no outer-data search or per-cohort tuning."""
     branch = 'gaussian' if allow_exclusion else 'gaussian_noninjective'
@@ -133,12 +139,51 @@ def _standalone_recipes():
                 gaussian_noninjective=dict(p=0,c=0,g=1,gaussian_branch='gaussian_noninjective'))
 
 
-def _standalone_report(rows, branches, calibrated, labels):
-    return {name:dict(raw=_probability_metrics(rows,mix_branches(branches,recipe),labels),
+def _source_group_scores(rows, lp, labels, source_intervention):
+    if not source_intervention or source_intervention.get('status') != 'available':
+        return {}
+    from .q8_evaluation import score_intervention_groups
+    return score_intervention_groups(rows, labels, np.exp(lp), source_intervention)
+
+
+def _standalone_report(rows, branches, calibrated, labels, source_intervention=None, evaluation=None):
+    result = {name:dict(raw=_probability_metrics(rows,mix_branches(branches,recipe),labels),
                       calibrated=_probability_metrics(rows,mix_branches(calibrated,recipe),labels),
                       active_rows=int(_branch_active(branches,name).sum()),
                       fallback_rows=int((~_branch_active(branches,name)).sum()))
             for name,recipe in _standalone_recipes().items()}
+    evaluation = evaluation or {}
+    for name, record in result.items():
+        # Availability is checkpoint-level; an available relation branch can
+        # still have no active rows in a singleton-only evaluation cohort.
+        available = evaluation.get('branch_availability', {}).get(name)
+        if available is None and record['active_rows']:
+            available = True
+        record.update(available=available,
+                      score_scope=('plain' if name == 'plain' else
+                                   'branch_with_plain_fallback' if record['active_rows'] else
+                                   'plain_fallback_only'))
+    centered = result['centered']
+    trained = evaluation.get('head_cache', {}).get(
+        'centered_trained', evaluation.get('branch_availability', {}).get('centered'))
+    centered.update(trained=trained,
+                    training_evidence=evaluation.get('provenance', {}).get('centered_training_evidence'))
+    if not centered['active_rows']:
+        centered['interpretation'] = (
+            'No effective centered training is recorded. These values are entirely plain fallbacks, not centered-head quality.'
+            if trained is False else
+            'This cohort has no active centered rows. These values are entirely plain fallbacks, not centered-head quality.')
+    else:
+        centered['interpretation'] = (
+            'Centered scores on active relation rows and plain fallback elsewhere; this is not an isolated estimate of the centered training benefit.')
+    if not source_intervention or source_intervention.get('status') != 'available':
+        return result
+    for name, recipe in _standalone_recipes().items():
+        for scale, values in (('raw', branches), ('calibrated', calibrated)):
+            groups = _source_group_scores(rows, mix_branches(values, recipe), labels, source_intervention)
+            if groups:
+                result[name][scale]['by_source_intervention_label_coverage'] = groups
+    return result
 
 
 def _load_cohorts(directory, split, role):
@@ -184,14 +229,8 @@ def _load_cohorts(directory, split, role):
     return cohorts, index
 
 
-def fit_branch_calibration(inner_evaluation_dir, split_manifest, training_evidence):
-    """Fit four independent scalar temperatures; never inspect outer caches."""
-    evidence = validate_training_evidence(training_evidence,split_manifest)
-    cohorts,index = _load_cohorts(inner_evaluation_dir,split_manifest,'inner_dev')
-    if index.get('provenance',{}).get('model_identity_sha256') != evidence['model_identity_sha256']:
-        raise ValueError('Development calibration does not bind the declared checkpoint.')
-    rows,branches = cohorts['full']
-    labels = split_manifest['labels']
+def fit_temperature_records(rows, branches, labels, *, fit_scope="full inner dev"):
+    """Fit the declared scalar objective on supplied rows; caller owns split evidence."""
     y = rows.model.map({label:i for i,label in enumerate(labels)}).to_numpy()
     records = {}
     for name in _standalone_recipes():
@@ -223,7 +262,19 @@ def fit_branch_calibration(inner_evaluation_dir, split_manifest, training_eviden
                              class_counts={label:int(counts[i]) for i,label in enumerate(labels)},
                              balanced_nll_before=objective(0.),balanced_nll_after=objective(np.log(temperature)),
                              boundary=bool(np.isclose(temperature,.05) or np.isclose(temperature,20.)),
-                             optimizer_evaluations=int(result.nfev),status='fitted on full inner dev active rows')
+                             optimizer_evaluations=int(result.nfev),status=f'fitted on {fit_scope} active rows')
+    return records
+
+
+def fit_branch_calibration(inner_evaluation_dir, split_manifest, training_evidence):
+    """Fit four independent scalar temperatures; never inspect outer caches."""
+    evidence = validate_training_evidence(training_evidence,split_manifest)
+    cohorts,index = _load_cohorts(inner_evaluation_dir,split_manifest,'inner_dev')
+    if index.get('provenance',{}).get('model_identity_sha256') != evidence['model_identity_sha256']:
+        raise ValueError('Development calibration does not bind the declared checkpoint.')
+    rows,branches = cohorts['full']
+    labels = split_manifest['labels']
+    records = fit_temperature_records(rows, branches, labels)
     directory = Path(inner_evaluation_dir)
     calibration = dict(policy='independent_branch_temperature_v1',specification=_calibration_spec(),
                        split_sha256=split_manifest['split_sha256'],labels=labels,
@@ -267,7 +318,8 @@ def select_calibrated_recipe(inner_evaluation_dir, split_manifest, training_evid
 
 
 def _select_recipe(inner_evaluation_dir, split_manifest, training_evidence, out, *,
-                   allow_exclusion=False, calibration=None):
+                   allow_exclusion=False, calibration=None, selection_branches=None,
+                   crossfit_evidence=None):
     """Select by full-inner-dev BA only; stress cohorts are disclosed, not retuned."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -283,18 +335,32 @@ def _select_recipe(inner_evaluation_dir, split_manifest, training_evidence, out,
         calibration = _bind_calibration(calibration,inner_evaluation_dir,split_manifest,index,evidence)
         cohorts = {name:(rows,apply_branch_calibration(branches,calibration))
                    for name,(rows,branches) in raw_cohorts.items()}
-        standalone = {name:_standalone_report(rows,branches,cohorts[name][1],split_manifest['labels'])
+        standalone = {name:_standalone_report(rows,branches,cohorts[name][1],split_manifest['labels'], index.get('source_intervention'), index)
                       for name,(rows,branches) in raw_cohorts.items()}
     recipes = candidate_recipes(allow_exclusion)
     candidates = []
     for recipe in recipes:
         score = _metrics if calibration is None else _probability_metrics
-        scores = {name:score(rows,mix_branches(branches,recipe),split_manifest['labels'])
-                  for name,(rows,branches) in cohorts.items()}
-        candidates.append(dict(recipe=recipe, cohorts=scores))
+        scores = {}
+        for name, (rows, branches) in cohorts.items():
+            lp = mix_branches(branches, recipe)
+            scores[name] = score(rows, lp, split_manifest['labels'])
+            groups = _source_group_scores(rows, lp, split_manifest['labels'], index.get('source_intervention'))
+            if groups:
+                scores[name]['by_source_intervention_label_coverage'] = groups
+        candidate = dict(recipe=recipe, cohorts=scores)
+        if selection_branches is not None:
+            candidate['selection_score'] = _probability_metrics(
+                raw_cohorts['full'][0], mix_branches(selection_branches, recipe), split_manifest['labels'])
+        candidates.append(candidate)
     # Fixed list order breaks ties. Do not optimize NLL or sparse layouts after seeing outer results.
-    winner = max(range(len(candidates)), key=lambda i:candidates[i]['cohorts']['full']['balanced_accuracy'])
+    winner = max(range(len(candidates)), key=lambda i:candidates[i].get(
+        'selection_score', candidates[i]['cohorts']['full'])['balanced_accuracy'])
     locked = dict(policy='inner_prompt_fusion_v1', split_sha256=split_manifest['split_sha256'],
+                  data_governance=index.get('data_governance', dict(status='unavailable')),
+                  validation_scope=index.get('validation_scope', dict(kind='unrecorded')),
+                  source_intervention=index.get('source_intervention', dict(status='unrecorded')),
+                  actual_source_intervention_exposure=index.get('actual_source_intervention_exposure'),
                   outer_fold=split_manifest['outer_fold'], labels=split_manifest['labels'],
                   recipe=recipes[winner], candidate_family_sha256=_digest(recipes),
                   selection=dict(objective='full inner-development balanced accuracy', tie_break='earliest preregistered candidate',
@@ -303,18 +369,31 @@ def _select_recipe(inner_evaluation_dir, split_manifest, training_evidence, out,
                   training_evidence=evidence,
                   model_identity_sha256=evidence['model_identity_sha256'],
                   inference_options_sha256=_digest(index['options']),
+                  inference_core_options=inference_core_options(index['options']),
+                  inference_core_options_sha256=_digest(inference_core_options(index['options'])),
                   source_evaluation_sha256=file_sha(Path(inner_evaluation_dir)/'evaluation.json'),
                   role='locked_inner_selection', allow_class_exclusion=bool(allow_exclusion),
                   interpretation='Noninjective family is the primary comparison. Exclusion-enabled family is sensitivity to an unguaranteed class-uniqueness assumption; neither is a leaderboard claim.')
     if calibration is not None:
         locked.update(policy='calibrated_inner_v2',calibration=calibration)
         _write(out/'calibration.json',calibration)
+    if selection_branches is not None:
+        if calibration is None or crossfit_evidence is None:
+            raise ValueError('Cross-fitted selection requires final full-dev calibration and split evidence.')
+        locked.update(policy='crossfit_calibrated_inner_v3', crossfit=crossfit_evidence)
+        locked['selection']['objective'] = 'Full inner-dev BA from prompt-cross-fitted temperature predictions'
     locked['recipe_sha256'] = _digest(locked)
     diagnostic = dict(candidates=candidates, selected_index=winner,
+                      data_governance=locked['data_governance'], validation_scope=locked['validation_scope'],
+                      source_intervention=locked['source_intervention'],
+                      actual_source_intervention_exposure=locked['actual_source_intervention_exposure'],
                       stress_cohorts='Overlapping descriptive scenarios, not independent confirmations.')
     if standalone is not None:
         diagnostic['standalone_branches'] = standalone
         diagnostic['development_interpretation'] = 'Same dev labels fit scalar temperatures and choose weights; these are optimistic fitting diagnostics, not held-out quality estimates.'
+    if selection_branches is not None:
+        diagnostic.update(crossfit=crossfit_evidence,
+                          development_interpretation='selection_score uses temperature fits excluding each row\'s prompt. Cohort scores use the final full-dev temperature refit and are fitting diagnostics. Choosing weights still uses these 24 prompts; this is not an unbiased estimate of selected quality.')
     _write(out/'candidate_scores.json',diagnostic)
     _write(out/'recipe.json',locked)
     return locked
@@ -328,10 +407,10 @@ def apply_recipe(recipe, outer_evaluation_dir, split_manifest, out):
         raise ValueError('Locked recipe changed.')
     if recipe['split_sha256'] != split_manifest['split_sha256']:
         raise ValueError('Locked recipe belongs to another split.')
-    if recipe['policy'] not in ('inner_prompt_fusion_v1','calibrated_inner_v2'):
+    if recipe['policy'] not in ('inner_prompt_fusion_v1','calibrated_inner_v2','crossfit_calibrated_inner_v3'):
         raise ValueError('Unknown locked fusion protocol.')
     calibration = None
-    if recipe['policy'] == 'calibrated_inner_v2':
+    if recipe['policy'] in ('calibrated_inner_v2','crossfit_calibrated_inner_v3'):
         calibration = _validate_calibration(recipe['calibration'])
         if any(calibration[key] != recipe[key] for key in ('split_sha256','labels','model_identity_sha256','inference_options_sha256')):
             raise ValueError('Locked calibration and fusion recipe have different identities.')
@@ -340,27 +419,56 @@ def apply_recipe(recipe, outer_evaluation_dir, split_manifest, out):
     if (out/'application.json').exists():
         raise FileExistsError('Outer application already exists; preserve the first locked evaluation.')
     cohorts,index = _load_cohorts(outer_evaluation_dir, split_manifest, 'outer_test')
+    recorded_source_scope = recipe.get('source_intervention') or {}
+    if recorded_source_scope.get('status') == 'available':
+        from .q8_evaluation import shared_intervention_scope
+        if shared_intervention_scope([recorded_source_scope, index.get('source_intervention')]) is None:
+            raise ValueError('Outer evaluation lacks the source-intervention scope used for inner selection.')
+        if (recorded_source_scope.get('arm_variant') is not None and
+                recorded_source_scope['arm_variant'] != index['source_intervention'].get('arm_variant')):
+            raise ValueError('Inner selection and outer evaluation must use the same source-intervention arm.')
+    recorded_governance = recipe.get('data_governance') or {}
+    outer_governance = index.get('data_governance') or {}
+    if recorded_governance.get('status') == 'available' and (
+            outer_governance.get('status') != 'available' or any(
+                recorded_governance.get(key) != outer_governance.get(key)
+                for key in ('manifest_sha256', 'data_sha256', 'rows_sha256'))):
+        raise ValueError('Outer evaluation must retain the governance binding used for inner selection.')
     if index.get('provenance',{}).get('model_identity_sha256') != recipe['model_identity_sha256']:
         raise ValueError('Outer branches came from a different checkpoint; do not refit after selection.')
-    if _digest(index['options']) != recipe['inference_options_sha256']:
-        raise ValueError('Outer branch inference settings differ from inner selection.')
+    if recipe.get('inference_core_options_sha256') is not None:
+        expected = recipe['inference_core_options_sha256']
+        if (_digest(recipe.get('inference_core_options')) != expected or
+                _digest(inference_core_options(index['options'])) != expected):
+            raise ValueError('Outer grouping/Gaussian settings differ from inner selection.')
+    elif _digest(index['options']) != recipe['inference_options_sha256']:
+        raise ValueError('Legacy recipes require identical recorded evaluation options; select a new locked recipe to add stress scenarios.')
     reports={}
     standalone={}
     for name,(rows,branches) in cohorts.items():
         if calibration is not None:
             calibrated = apply_branch_calibration(branches,calibration)
-            standalone[name] = _standalone_report(rows,branches,calibrated,recipe['labels'])
+            standalone[name] = _standalone_report(rows,branches,calibrated,recipe['labels'], index.get('source_intervention'), index)
             branches = calibrated
         lp=mix_branches(branches,recipe['recipe'])
         score = _metrics if calibration is None else _probability_metrics
         reports[name]=score(rows,lp,recipe['labels'])
+        groups = _source_group_scores(rows, lp, recipe['labels'], index.get('source_intervention'))
+        if groups:
+            reports[name]['by_source_intervention_label_coverage'] = groups
         predictions=rows[['id','prompt_id','model','fold','n_words','group_size']].copy()
         predictions['pred_model']=np.asarray(recipe['labels'])[lp.argmax(1)]
         for label,values in zip(recipe['labels'],np.exp(lp).T):
             predictions['prob__'+label]=values
         predictions.to_parquet(out/(name+'_predictions.parquet'),index=False)
     report=dict(recipe_sha256=recipe['recipe_sha256'], split_sha256=split_manifest['split_sha256'],
+                data_governance=index.get('data_governance', dict(status='unavailable')),
+                validation_scope=index.get('validation_scope', dict(kind='unrecorded')),
+                source_intervention=index.get('source_intervention', dict(status='unrecorded')),
+                actual_source_intervention_exposure=index.get('actual_source_intervention_exposure'),
                 selected_recipe=recipe['recipe'], cohorts=reports,
+                applied_evaluation_options=index['options'],
+                stress_membership_options_changed=(_digest(index['options']) != recipe['inference_options_sha256']),
                 scope='Outer prompt evaluation after locked inner selection; overlapping sparse cohorts are sensitivity diagnostics.')
     if calibration is not None:
         report.update(policy=recipe['policy'],calibration_sha256=calibration['calibration_sha256'],

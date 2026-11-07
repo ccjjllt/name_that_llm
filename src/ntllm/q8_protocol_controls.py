@@ -111,7 +111,9 @@ def build_pair(anchor, candidates, safe, left, right, seed, focus):
     safe_rows = anchor.loc[safe]
     for model in sorted(focus):
         for bin_index, word_bin in enumerate(WORD_BINS):
-            slots = safe_rows.index[safe_rows.model.eq(model) & safe_rows.word_bin.eq(word_bin)].to_numpy()
+            # Pandas may expose read-only index storage; NumPy's permutation
+            # path for very small strata can require a writable array.
+            slots = safe_rows.index[safe_rows.model.eq(model) & safe_rows.word_bin.eq(word_bin)].to_numpy(copy=True)
             pools = {}
             for condition in (left, right):
                 if condition == "historical_anchor":
@@ -226,11 +228,22 @@ def build(args):
                             evidence_ledger=os.path.relpath(evidence, path.resolve()),
                             evidence_ledger_sha256=report['evidence_ledger_sha256'])
             write_json(path / "manifest.json", manifest)
+            # Scope is a separately bound annotation. Adding it cannot change
+            # this manifest's data identity or the original experimental slots.
+            from .q8_source_scope import build_source_scope
+            scope = build_source_scope(path, exposure=exposure)
+            detail['display_name'] = scope['display_name']
+            detail['changed_text_rows'] = scope['summary']['changed_text_rows']
+            detail['changed_fraction'] = scope['summary']['changed_fraction']
+            detail['directly_replaced_labels'] = scope['summary']['directly_replaced_labels']
+            detail['intervention_scope'] = {key: scope[key] for key in
+                                           ('status', 'display_name', 'manifest_path', 'manifest_sha256')}
             detail["data_dir"] = str(path.resolve())
         report["comparisons"].append(detail)
     write_json(args.out / "controls.json", report)
     print(json.dumps({key: report[key] for key in ("actual_centered_unique", "safe_actual_plain_slots", "candidate_counts")}, ensure_ascii=False))
-    print(json.dumps([{k: row[k] for k in ("name", "replacement_slots", "status")} for row in report["comparisons"]]))
+    print(json.dumps([{k: row[k] for k in ("name", "display_name", "replacement_slots", "changed_text_rows", "changed_fraction", "status")
+                       if k in row} for row in report["comparisons"]], ensure_ascii=False))
     return report
 
 

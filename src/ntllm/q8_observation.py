@@ -56,7 +56,7 @@ def observation_plan(windows, config, phase, target_updates):
 
 
 def save_learning_snapshot(path, model, optimizer, scheduler, scaler, progress, metadata,
-                           reasons, observation_count, evaluate=None):
+                           reasons, observation_count, evaluate=None, evaluation_deadline=None):
     """Retain complete states separately from the rotating recovery checkpoints."""
     from .q8_checkpoint import save_training_checkpoint
     path = Path(path)
@@ -64,6 +64,15 @@ def save_learning_snapshot(path, model, optimizer, scheduler, scaler, progress, 
         old = json.loads((path / 'snapshot.json').read_text())
         if old['successful_updates'] != progress['step'] or old['target_updates'] != progress['target_updates']:
             raise ValueError('A saved learning-curve snapshot has another training horizon.')
+        if (old.get('development_status') == 'pending' and evaluate is not None
+                and (evaluation_deadline is None or time.perf_counter() < evaluation_deadline)):
+            started = time.perf_counter()
+            with preserve_observation_state(model):
+                report = evaluate(path, progress['step'])
+                (path / 'development_observation.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+            old['development_status'] = 'complete'
+            old['save_and_development_seconds'] = old.get('save_and_development_seconds', 0.) + time.perf_counter() - started
+            (path / 'snapshot.json').write_text(json.dumps(old, ensure_ascii=False, indent=2) + '\n')
         return old
     step, horizon = progress['step'], progress['target_updates']
     note = dict(successful_updates=step, target_updates=horizon,
@@ -72,6 +81,7 @@ def save_learning_snapshot(path, model, optimizer, scheduler, scaler, progress, 
                 last_lr_multiplier=lr_multiplier(step - 1, horizon, metadata['settings']['warmup_fraction']),
                 next_lr_multiplier=lr_multiplier(step, horizon, metadata['settings']['warmup_fraction']),
                 optimizer_group_lrs_next={group['name']: group['lr'] for group in optimizer.param_groups},
+                development_status='pending' if evaluate is not None else 'not_requested',
                 interpretation='An intermediate point in this horizon is not a completed shorter-horizon experiment.')
     snapshot_metadata = copy.deepcopy(metadata)
     snapshot_metadata.update(status='research_snapshot', prepared_only=False, snapshot=note,
@@ -88,16 +98,19 @@ def save_learning_snapshot(path, model, optimizer, scheduler, scaler, progress, 
         (path / 'snapshot.json').write_text(json.dumps(note, ensure_ascii=False, indent=2) + '\n')
         if metadata.get('model_assets'):
             (path / 'base_identity.json').write_text(json.dumps(metadata['model_assets']['content'], sort_keys=True) + '\n')
-        if evaluate is not None:
+        if evaluate is not None and (evaluation_deadline is None or time.perf_counter() < evaluation_deadline):
             report = evaluate(path, step)
             (path / 'development_observation.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+            note['development_status'] = 'complete'
     note['save_and_development_seconds'] = time.perf_counter() - started
     (path / 'snapshot.json').write_text(json.dumps(note, ensure_ascii=False, indent=2) + '\n')
     return note
 
 
 def evaluate_inner_development(model, fit, dev, labels, split, settings, output, *,
-                               phase, training_rows_path, step, centered_trained, centered_evidence=None):
+                               phase, training_rows_path, step, centered_trained, centered_evidence=None,
+                               data_governance=None, validation_scope=None,
+                               source_intervention=None, actual_source_intervention_exposure=None):
     """Use no outer outcomes. Every fitted relation transform uses inner fit."""
     from .q8_data import file_sha
     from .q8_inner import checkpoint_identity
@@ -110,14 +123,19 @@ def evaluate_inner_development(model, fit, dev, labels, split, settings, output,
     for name in ('model_config.json', 'base_identity.json'):
         if (checkpoint / name).exists(): artifacts[name] = checkpoint / name
     identity = checkpoint_identity(artifacts)
+    use_gaussian = settings.get('eval_gaussian', True)
     with preserve_observation_state(model):
-        query = model.predict_outputs(model.encode(dev.text.tolist()), settings['eval_batch_size'], keep_features=True)
-        features = model.predict_outputs(model.encode(fit.text.tolist()), settings['eval_batch_size'], keep_features=True)['features']
+        query = model.predict_outputs(model.encode(dev.text.tolist()), settings['eval_batch_size'], keep_features=use_gaussian)
+        features = (model.predict_outputs(model.encode(fit.text.tolist()), settings['eval_batch_size'], keep_features=True)['features']
+                    if use_gaussian else None)
         report = evaluate_cohorts(
             fit, dev.assign(fold=split['outer_fold']), labels, query['plain_logits'],
             query['raw_centered_logits'], query['centered_bias'], output,
             query_features=query['features'], fit_features=features, centered_trained=centered_trained,
             provenance=dict(role='inner_dev', phase=phase, checkpoint_updates=step,
+                            data_governance=data_governance, validation_scope=validation_scope,
+                            source_intervention=source_intervention,
+                            actual_source_intervention_exposure=actual_source_intervention_exposure,
                             split_sha256=split['split_sha256'],
                             model_identity_sha256=identity['model_identity_sha256'],
                             centered_training_evidence=centered_evidence,
@@ -125,6 +143,9 @@ def evaluate_inner_development(model, fit, dev, labels, split, settings, output,
                             official_optimizer_training_ids=fit.id.astype(str).tolist() if phase == 'official' else [],
                             public_external_history=split['public_external_history']),
             config=dict(grouping_protocol='train_fold', seeds=settings.get('eval_cohort_seeds', [42,43]),
+                        **({'imbalance_suite': settings['eval_imbalance_suite']}
+                           if settings.get('eval_imbalance_suite') is not None else {}),
+                        gaussian_noninjective=settings.get('eval_gaussian_noninjective', True),
                         cluster_threshold=settings.get('eval_cluster_threshold', .15)))
     evidence = dict(split_sha256=split['split_sha256'],
                     official_training_rows_file=str(Path(training_rows_path).resolve()),
@@ -134,4 +155,7 @@ def evaluate_inner_development(model, fit, dev, labels, split, settings, output,
     (output / 'training_evidence.json').write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + '\n')
     return dict(split_sha256=split['split_sha256'], role='inner_dev', phase=phase, step=step,
                 evaluation_dir=str(output.resolve()), full_views=report['cohorts']['full']['views'],
+                data_governance=data_governance, validation_scope=validation_scope,
+                source_intervention=source_intervention,
+                actual_source_intervention_exposure=actual_source_intervention_exposure,
                 selection_allowed=phase == 'official', outer_labels_used=False)

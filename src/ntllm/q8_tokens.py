@@ -57,18 +57,20 @@ def tokenizer_identity(directory, tokenizer=None):
     return result
 
 
-def encode_with_statistics(tokenizer, texts, max_len, batch_size=2048):
+def encode_with_statistics(tokenizer, texts, max_len, batch_size=2048, *, retain_tokens=True):
     """Return production IDs and measured before/after truncation row metadata.
 
     Two real tokenizer calls preserve special-token and truncation semantics.
     The returned IDs are the truncated call itself, not manually sliced IDs.
+    Measurement-only callers can discard each batch's IDs after recording its
+    statistics; in that case the first return value is None, not a full pool.
     """
     if max_len < 2 or batch_size < 1:
         raise ValueError("max_len must be >=2 and batch_size must be positive.")
     texts = list(texts)
     if any(not isinstance(text, str) for text in texts):
         raise ValueError("Token accounting requires unmodified string texts.")
-    encoded, records = [], []
+    encoded, records = ([] if retain_tokens else None), []
     for start in range(0, len(texts), batch_size):
         part = texts[start:start + batch_size]
         raw = tokenizer(part, truncation=False, return_attention_mask=False)["input_ids"]
@@ -86,7 +88,8 @@ def encode_with_statistics(tokenizer, texts, max_len, batch_size=2048):
                 raw_tokens=len(before), input_tokens=len(after), removed_tokens=removed,
                 truncated=removed > 0,
             ))
-        encoded.extend(kept)
+        if retain_tokens:
+            encoded.extend(kept)
     columns = ["position", "raw_text_sha256", "input_ids_sha256", "raw_tokens",
                "input_tokens", "removed_tokens", "truncated"]
     return encoded, pd.DataFrame(records, columns=columns)

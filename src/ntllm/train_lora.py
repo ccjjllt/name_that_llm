@@ -122,6 +122,79 @@ def token_rows_identity(stats):
     return {'rows': len(stats), 'sha256': digest.hexdigest()}
 
 
+def measure_token_inputs(tokenizer, tokenizer_directory, frame, relation_frame, windows_by_epoch,
+                         max_updates, config, run_dir, *, plan_only=False, prepared=None,
+                         reference_identity=None, frozen_metadata=None, resume_metadata=None):
+    """Encode each input stream once, verify its inputs, and profile once.
+
+    Planning retains statistics only. Training returns the actual model
+    tokenizer's IDs and checks them against frozen measurements, never against
+    a second newly encoded copy of the entire pool.
+    """
+    from .q8_tokens import encode_with_statistics, tokenizer_identity, profile_plan
+    identity = tokenizer_identity(tokenizer_directory, tokenizer)
+    frozen_metadata = frozen_metadata or {}
+    reference_identity = reference_identity or {}
+    if reference_identity and identity['files_identity_sha256'] != reference_identity['files_identity_sha256']:
+        raise ValueError('The actual tokenizer files differ from the requested or frozen tokenizer.')
+    columns = ['raw_text_sha256', 'input_ids_sha256', 'raw_tokens', 'input_tokens', 'removed_tokens', 'truncated']
+    frozen_rows = Path(prepared) / 'token_rows.parquet' if prepared is not None else None
+    has_frozen_rows = frozen_rows is not None and frozen_rows.is_file()
+    if not has_frozen_rows and not frozen_metadata.get('planned_token_identity') and reference_identity.get('runtime'):
+        # Without frozen row evidence, only reuse a reference whose effective
+        # implementation matches. Loading its identity does not encode a pool.
+        for key in ('runtime', 'backend_tokenizer_sha256'):
+            if identity.get(key) != reference_identity.get(key):
+                raise ValueError(f'Tokenizer reference differs in {key}; prepare measured inputs before using another implementation.')
+    tokens, stats = encode_with_statistics(tokenizer, frame.text.tolist(), config['max_len'],
+                                           retain_tokens=not plan_only)
+    relation_tokens, relation_stats = (encode_with_statistics(
+        tokenizer, relation_frame.text.tolist(), config['max_len'], retain_tokens=not plan_only)
+        if relation_frame is not None else (None, None))
+    plain_identity = token_rows_identity(stats)
+    relation_identity = token_rows_identity(relation_stats) if relation_stats is not None else None
+    if has_frozen_rows:
+        if not pd.read_parquet(frozen_rows, columns=columns).equals(stats[columns]):
+            raise ValueError('Tokenizer inputs or truncation differ from the reviewed plan.')
+    if prepared is not None and relation_stats is not None:
+        frozen_relations = Path(prepared) / 'relation_token_rows.parquet'
+        if has_frozen_rows and not frozen_relations.is_file():
+            raise ValueError('The reviewed plan is missing its anchor token rows.')
+        if frozen_relations.is_file() and not pd.read_parquet(frozen_relations, columns=columns).equals(relation_stats[columns]):
+            raise ValueError('Anchor token inputs differ from the reviewed plan.')
+    for key, value in (('planned_token_identity', plain_identity),
+                       ('planned_relation_token_identity', relation_identity)):
+        if key in frozen_metadata and frozen_metadata[key] != value:
+            raise ValueError(f'Frozen token input identity differs: {key}.')
+    if resume_metadata:
+        for key, value in (('executed_token_identity', plain_identity),
+                           ('executed_relation_token_identity', relation_identity)):
+            if resume_metadata.get(key) != value:
+                raise ValueError(f'Resume actual tokenizer inputs differ: {key}.')
+        previous = resume_metadata.get('executed_tokenizer_identity') or {}
+        for key in ('files_identity_sha256', 'runtime', 'backend_tokenizer_sha256'):
+            if identity.get(key) != previous.get(key):
+                raise ValueError(f'Resume tokenizer implementation differs: {key}.')
+    profile_plan(frame, stats, windows_by_epoch, max_updates, config, run_dir,
+                 relation_stats=relation_stats, relation_frame=relation_frame)
+    measured = dict(tokenizer_identity=identity,
+                    token_rows_sha256=file_sha(run_dir / 'token_rows.parquet'),
+                    token_profile_sha256=file_sha(run_dir / 'token_profile.json'),
+                    planned_token_identity=plain_identity, planned_relation_token_identity=relation_identity)
+    if not plan_only:
+        # Preserve both historical artifact locations with identical files,
+        # not another profile_plan pass or another in-memory statistics table.
+        execution_dir = run_dir / 'execution_tokens'
+        execution_dir.mkdir(exist_ok=True)
+        for name in ('token_rows.parquet', 'relation_token_rows.parquet', 'token_profile.json',
+                     'step_token_metrics.parquet', 'physical_token_batches.parquet'):
+            if (run_dir / name).is_file():
+                shutil.copy2(run_dir / name, execution_dir / name)
+        measured.update(executed_token_identity=plain_identity, executed_relation_token_identity=relation_identity,
+                        executed_tokenizer_identity=identity)
+    return tokens, relation_tokens, stats, relation_stats, measured
+
+
 def update_windows(batches, target_rows):
     """Keep complete microbatches and use the same update count for equal row budgets."""
     cumulative = np.cumsum([len(rows) for rows, _ in batches])
@@ -481,11 +554,12 @@ def backward_window(model, tokens, targets, weights, centered_weights, chunk, dr
 
 
 def train(model, tokens, targets, weights, centered_weights, plan, config, phase, run_dir, max_updates=None,
-          resume=None, checkpoint_every=0, stop_after_updates=None, segment_seconds=None, metadata=None,
+          resume=None, checkpoint_every=None, stop_after_updates=None, segment_seconds=None, metadata=None,
           relation_tokens=None, frozen_positions=None, frozen_full_updates=None,
-          token_stats=None, relation_token_stats=None, development_evaluator=None):
+          token_stats=None, relation_token_stats=None, development_evaluator=None,
+          checkpoint_seconds=None, segment_started_at=None):
     import torch
-    from .q8_checkpoint import save_training_checkpoint, load_training_state
+    from .q8_checkpoint import save_training_checkpoint, load_training_state, execution_policy
 
     optimizer, parameters = make_optimizer(model, config, phase)
     windows = [update_windows(epoch, config['batch_size'] * config['accumulation']) for epoch in plan]
@@ -511,10 +585,12 @@ def train(model, tokens, targets, weights, centered_weights, plan, config, phase
     scaler = torch.amp.GradScaler('cuda', init_scale=256.0, enabled=scale)
     dropout = torch.nn.Dropout(config['head_dropout'])
     step, exposed, relation_exposed, previous_elapsed = 0, [], [], 0.0
+    saved_policy = None
     if relation_tokens is not None and len(relation_tokens) != len(tokens):
         raise ValueError('Plain and anchor token arrays must cover the same aligned slots.')
     if resume is not None:
         restored = load_training_state(resume, optimizer, scheduler, scaler, model.device)
+        saved_policy = restored['metadata'].get('execution_policy')
         progress = restored['progress']
         step = int(progress['step'])
         exposed = list(progress['exposed_rows'])
@@ -540,39 +616,96 @@ def train(model, tokens, targets, weights, centered_weights, plan, config, phase
         if (progress['next_epoch'], progress['next_window']) != next_position:
             raise ValueError('Checkpoint cursor differs from the reconstructed training plan.')
     initial_step = step
+    policy = execution_policy(saved=(metadata or {}).get('execution_policy', saved_policy),
+                              checkpoint_every=checkpoint_every, checkpoint_seconds=checkpoint_seconds,
+                              stop_after_updates=stop_after_updates, segment_seconds=segment_seconds)
+    metadata = dict(metadata or {}, execution_policy=policy)
+    metadata.setdefault('settings', config)
+    source_intervention = metadata.get('source_intervention') or {}
+    source_changes = None
+    if phase == 'external' and source_intervention.get('status') == 'available':
+        if file_sha(Path(source_intervention['changed_rows_path'])) != source_intervention['changed_rows_sha256']:
+            raise ValueError('Source replacement rows changed after their scope was recorded.')
+        source_changes = pd.read_parquet(source_intervention['changed_rows_path'])
+
+    def source_exposure():
+        if source_changes is None:
+            return metadata.get('actual_source_intervention_exposure')
+        from .q8_source_scope import source_exposure_summary
+        return source_exposure_summary(source_intervention, exposed, changed_rows=source_changes)
+    write_json(run_dir / 'execution_policy.json', policy)
+    checkpoint_every, checkpoint_seconds = policy['checkpoint_every'], policy['checkpoint_seconds']
+    segment_seconds, stop_after_updates = policy['segment_seconds'], policy['stop_after_updates']
     stop_at = min(target_updates, step + stop_after_updates) if stop_after_updates else target_updates
     start = time.perf_counter()
+    segment_started_at = start if segment_started_at is None else segment_started_at
+    last_save_time = start
     last_checkpoint = None
     last_saved_step = None
+
+    def segment_expired():
+        return bool(segment_seconds and time.perf_counter() - segment_started_at >= segment_seconds)
 
     def completed_centered_mass(count):
         return sum(float(centered_weights[epoch, rows].astype(np.float64).sum())
                    * config['centered_weight'] / sum(len(part) for part, _ in chunk)
                    for epoch, _, chunk in positions[:count] for rows, same in chunk if same)
 
-    def checkpoint():
-        nonlocal last_checkpoint, last_saved_step
+    actual_centered_mass = completed_centered_mass(step)
+
+    def checkpoint(reason):
+        nonlocal last_checkpoint, last_saved_step, last_save_time
         if last_saved_step == step:
             return last_checkpoint
         epoch, window = all_positions[step][:2] if step < planned else (len(windows), 0)
         progress = dict(step=step, next_epoch=epoch, next_window=window, exposed_rows=exposed,
                         elapsed_seconds=previous_elapsed + time.perf_counter() - start,
-                        planned_updates=planned, target_updates=target_updates)
+                        planned_updates=planned, target_updates=target_updates, save_reason=reason)
         if relation_tokens is not None:
             progress.update(relation_exposed_rows=relation_exposed,
                             relation_data_sha256=(metadata or {}).get('relation_data_sha256'),
                             relation_input_mode='separate_frozen_anchor')
         last_checkpoint = save_training_checkpoint(
             run_dir / 'checkpoints' / f'step_{step:08d}', model, optimizer, scheduler, scaler,
-            progress, dict(metadata or {}, actual_centered_coefficient_mass=completed_centered_mass(step)),
+            progress, dict(metadata, actual_centered_coefficient_mass=actual_centered_mass,
+                           actual_source_intervention_exposure=source_exposure()),
             keep=int(config.get('checkpoint_keep', 2)))
         last_saved_step = step
-        print(f'Checkpoint: {last_checkpoint}', flush=True)
+        last_save_time = time.perf_counter()
+        print(f'Checkpoint ({reason}): {last_checkpoint}', flush=True)
         return last_checkpoint
 
+    pending_observation = False
+
+    def observe():
+        nonlocal pending_observation
+        # Also replay this event on resume: a process may have stopped after
+        # saving recovery state but before completing its held-out observation.
+        checkpoint('before_observation')
+        next_epoch, next_window = all_positions[step][:2] if step < planned else (len(windows), 0)
+        progress = dict(step=step, next_epoch=next_epoch, next_window=next_window, exposed_rows=exposed,
+                        elapsed_seconds=previous_elapsed + time.perf_counter() - start,
+                        planned_updates=planned, target_updates=target_updates,
+                        actual_centered_coefficient_mass=actual_centered_mass)
+        if relation_tokens is not None:
+            progress.update(relation_exposed_rows=relation_exposed,
+                            relation_data_sha256=metadata.get('relation_data_sha256'))
+        note = save_learning_snapshot(run_dir / 'snapshots' / f'step_{step:08d}', model,
+            optimizer, scheduler, scaler, progress,
+            dict(metadata, actual_source_intervention_exposure=source_exposure()),
+            snapshot_events[str(step)], len(snapshot_events), development_evaluator,
+            evaluation_deadline=segment_started_at + segment_seconds if segment_seconds else None)
+        pending_observation = note.get('development_status') == 'pending'
+
     model.train()
+    if resume is not None and str(step) in snapshot_events:
+        observe()
     with (run_dir / 'train_log.jsonl').open('w') as logfile:
         while step < stop_at:
+            # The wall clock includes preparation when called through run().
+            # Finish an in-flight optimizer window; never shorten its schedule.
+            if segment_expired():
+                break
             epoch_index, window_index, chunk = positions[step]
             chunk_rows = [row for rows, _ in chunk for row in rows]
             diagnostic = before_parameters = None
@@ -646,6 +779,10 @@ def train(model, tokens, targets, weights, centered_weights, plan, config, phase
                 write_json(diagnostic_dir / f'update_{step:08d}.json', diagnostic)
                 diagnostic_seconds += time.perf_counter() - diagnostic_start
             exposed.extend(chunk_rows)
+            for rows, same in chunk:
+                if same:
+                    actual_centered_mass += (float(centered_weights[epoch_index, rows].astype(np.float64).sum())
+                                             * config['centered_weight'] / row_count)
             relation_rows = [row for rows, same in chunk if same for row in rows]
             if relation_tokens is not None:
                 relation_exposed.extend(relation_rows)
@@ -676,22 +813,17 @@ def train(model, tokens, targets, weights, centered_weights, plan, config, phase
             if step == initial_step + 1 or step % 25 == 0 or step == target_updates:
                 print(f'update {step}/{target_updates} plain={record["plain_ce"]:.4f} centered={record["centered_ce"]:.4f}', flush=True)
             if checkpoint_every and step % checkpoint_every == 0:
-                checkpoint()
+                checkpoint('update_interval')
+            elif checkpoint_seconds and time.perf_counter() - last_save_time >= checkpoint_seconds:
+                checkpoint('time_interval')
             if str(step) in snapshot_events:
-                next_epoch, next_window = all_positions[step][:2] if step < planned else (len(windows), 0)
-                progress = dict(step=step, next_epoch=next_epoch, next_window=next_window, exposed_rows=exposed,
-                                elapsed_seconds=previous_elapsed + time.perf_counter() - start,
-                                planned_updates=planned, target_updates=target_updates,
-                                actual_centered_coefficient_mass=completed_centered_mass(step))
-                if relation_tokens is not None:
-                    progress.update(relation_exposed_rows=relation_exposed,
-                                    relation_data_sha256=(metadata or {}).get('relation_data_sha256'))
-                save_learning_snapshot(run_dir / 'snapshots' / f'step_{step:08d}', model,
-                    optimizer, scheduler, scaler, progress, metadata or {'settings':config},
-                    snapshot_events[str(step)], len(snapshot_events), development_evaluator)
-            if segment_seconds is not None and time.perf_counter() - start >= segment_seconds:
+                observe()
+            if segment_expired():
                 break
-    checkpoint()
+    stop_reason = ('segment_seconds' if pending_observation else
+                   'target_reached' if step >= target_updates else
+                   'stop_after_updates' if step >= stop_at else 'segment_seconds')
+    checkpoint(stop_reason)
     np.save(run_dir / 'actual_row_indices.npy', np.asarray(exposed, dtype=np.int32))
     if relation_tokens is not None:
         np.save(run_dir / 'actual_relation_row_indices.npy', np.asarray(relation_exposed, dtype=np.int32))
@@ -706,13 +838,17 @@ def train(model, tokens, targets, weights, centered_weights, plan, config, phase
                                  relation_token_stats if relation_token_stats is not None else token_stats,
                                  centered_exposed))
     return dict(successful_updates=step, segment_updates=step - initial_step,
-                actual_centered_coefficient_mass=completed_centered_mass(step),
+                actual_source_intervention_exposure=source_exposure(),
+                actual_centered_coefficient_mass=actual_centered_mass,
                 planned_updates=planned, target_updates=target_updates,
                 row_exposures=len(exposed), unique_training_rows=len(set(exposed)),
                 separate_relation_row_exposures=len(relation_exposed),
                 unique_separate_relation_rows=len(set(relation_exposed)),
-                partial=step < planned, interrupted=step < target_updates,
+                partial=step < planned, interrupted=step < target_updates or pending_observation,
+                pending_observation_updates=[step] if pending_observation else [],
                 train_seconds=round(previous_elapsed + elapsed, 3), segment_train_seconds=round(elapsed, 3),
+                segment_wall_seconds=round(time.perf_counter() - segment_started_at, 3),
+                stop_reason=stop_reason, execution_policy=policy,
                 last_checkpoint=str(last_checkpoint), resume_from=str(resume) if resume else None, **token_metrics)
 
 
@@ -753,6 +889,10 @@ def evaluate(model, fit_frame, frame, labels, fold, config, run_dir):
                                               if len(history) > 1 else None),
                      external_actual_dtype=history[1].get('dtype') if len(history) > 1 else None)
     provenance = dict(model_kind='q8_lora_fold', checkpoint=str(run_dir.resolve()), fold=int(fold),
+                      data_governance=metadata.get('data_governance'),
+                      validation_scope=metadata.get('validation_scope'),
+                      source_intervention=metadata.get('source_intervention'),
+                      actual_source_intervention_exposure=metadata.get('actual_source_intervention_exposure'),
                       data_manifest_sha256=metadata['data_manifest_sha256'],
                       base_config_sha256=model.base_config_sha256,
                       model_config=model.model_config,
@@ -774,8 +914,11 @@ def evaluate(model, fit_frame, frame, labels, fold, config, run_dir):
                           model_identity_sha256=identity['model_identity_sha256'],
                           model_scope='q8_inner_fit')
     evaluation_config = dict(grouping_protocol=config.get('eval_grouping_protocol', 'train_fold'),
+                             gaussian_noninjective=config.get('eval_gaussian_noninjective', True),
                              cluster_threshold=config.get('eval_cluster_threshold', .15),
                              seeds=config.get('eval_cohort_seeds', [42, 43]))
+    if config.get('eval_imbalance_suite') is not None:
+        evaluation_config['imbalance_suite'] = config['eval_imbalance_suite']
     report = evaluate_cohorts(
         fit_frame, frame.assign(fold=fold), labels, query['plain_logits'],
         query['raw_centered_logits'], query['centered_bias'], run_dir / 'evaluation',
@@ -791,6 +934,7 @@ def evaluate(model, fit_frame, frame, labels, fold, config, run_dir):
 
 
 def run(args):
+    segment_started_at = time.perf_counter()
     if getattr(args, 'backend_initial_state', None) is not None:
         if getattr(args, 'initial_state', None) is not None and args.initial_state != args.backend_initial_state:
             raise ValueError('Choose one common initialization path, not conflicting backend/strict paths.')
@@ -820,6 +964,8 @@ def run(args):
             setattr(args, name, saved)
         if args.base is None and resume_metadata.get('base'):
             args.base = Path(resume_metadata['base'])
+        if args.data_dir == Path('data/q8'):
+            args.data_dir = Path(resume_metadata['data_path']).parent
     elif prepared_metadata is not None:
         config = dict(prepared_metadata['settings'])
         for name in ('phase', 'fold', 'variant', 'max_updates'):
@@ -845,6 +991,13 @@ def run(args):
         if args.phase is None:
             raise ValueError('Choose --phase external/official, or supply --resume.')
         args.fold = args.fold if args.fold is not None else 'shared'
+    from .q8_checkpoint import execution_policy, EXECUTION_DEFAULTS
+    saved_execution = (resume_metadata or prepared_metadata or {}).get('execution_policy')
+    # Old frozen plans need no rewriting. Operational overrides never enter
+    # settings, its identity, loss normalization or the total LR horizon.
+    policy = execution_policy(config_path=args.config if args.config.is_file() else None,
+                              saved=saved_execution,
+                              **{name: getattr(args, name, None) for name in EXECUTION_DEFAULTS})
     defaults = dict(backend='hf', optimizer='adamw', loraplus_ratio=16.0, fused_adamw=False,
                     forward_batch_rows=config['batch_size'])
     for name, default in defaults.items():
@@ -856,10 +1009,11 @@ def run(args):
             config[name] = value
     if config['backend'] not in ('hf', 'unsloth', 'liger'):
         raise ValueError('backend must be hf, unsloth or liger.')
-    if config.get('fusion_protocol', 'inner_prompt_fusion_v1') not in ('inner_prompt_fusion_v1', 'calibrated_inner_v2'):
-        raise ValueError('Choose inner_prompt_fusion_v1 or calibrated_inner_v2 explicitly.')
-    if config.get('fusion_protocol') == 'calibrated_inner_v2' and (
+    if config.get('fusion_protocol', 'inner_prompt_fusion_v1') not in ('inner_prompt_fusion_v1', 'calibrated_inner_v2', 'crossfit_calibrated_inner_v3'):
+        raise ValueError('Choose inner_prompt_fusion_v1, calibrated_inner_v2 or crossfit_calibrated_inner_v3 explicitly.')
+    if config.get('fusion_protocol') in ('calibrated_inner_v2', 'crossfit_calibrated_inner_v3') and (
             not config.get('research_inner_validation') or not config.get('eval_gaussian', True)
+            or not config.get('eval_gaussian_noninjective', True)
             or config.get('eval_grouping_protocol', 'train_fold') != 'train_fold'):
         raise ValueError('Calibrated fusion requires fixed inner validation and all Gaussian views with train-fold grouping.')
     if getattr(args, 'backend_initial_state', None) is not None and config.get('initialization_mode') != 'canonical_backend':
@@ -877,6 +1031,50 @@ def run(args):
     if config['forward_batch_rows'] < config['batch_size']:
         raise ValueError('forward_batch_rows cannot split a logical training microbatch.')
     frame, valid, labels, y, weights, centered_weights, plan, details = prepare(args, config, resume_metadata)
+    # Governance annotates source evidence and interpretation; it never changes
+    # the frozen rows, labels, sampling weights, or optimizer schedule.
+    from .q8_governance import load_governance
+    pool_name = details['variant'] if details['variant'] in ('mix20', 'expanded') else 'baseline'
+    external_parent = details.get('external_initialization_config') or {}
+    recorded_governance = ((resume_metadata or {}).get('data_governance') or
+                           (external_parent.get('data_governance') if args.phase == 'official' else None))
+    if recorded_governance and recorded_governance.get('status') == 'available':
+        directory = (getattr(args, 'governance_dir', None)
+                     or Path(recorded_governance['manifest_path']).parent)
+        governance = load_governance(args.data_dir, pool_name, directory=directory)
+        if (governance.get('status') != 'available' or
+                governance['manifest_sha256'] != recorded_governance['manifest_sha256']):
+            raise ValueError('Resume and official adaptation must retain the recorded governance version.')
+    else:
+        governance = load_governance(args.data_dir, pool_name, directory=getattr(args, 'governance_dir', None))
+    governed_data_sha = details['data_sha256'] if args.phase == 'external' else external_parent.get('data_sha256')
+    if (governance.get('status') == 'available' and governed_data_sha is not None
+            and governance['data_sha256'] != governed_data_sha):
+        raise ValueError('Data governance belongs to a different external training pool.')
+    details['data_governance'] = governance
+    details['validation_scope'] = dict(
+        kind='fixed_public_pool_development',
+        official_prompt_holdout=bool(len(valid) or details.get('inner_split')),
+        upstream_official_dependence_removed=False,
+        independent_model_version_verification=False,
+        interpretation='Prompt-disjoint folds support development comparisons conditional on these public sources. They do not undo upstream official-informed prompt design, length targets or selection, nor independently verify source model versions.')
+    from .q8_source_scope import load_source_scope
+    recorded_source_scope = ((resume_metadata or {}).get('source_intervention') or
+                             (external_parent.get('source_intervention') if args.phase == 'official' else None))
+    scope_directory = getattr(args, 'source_scope_dir', None)
+    if recorded_source_scope and recorded_source_scope.get('status') == 'available':
+        scope_directory = scope_directory or Path(recorded_source_scope['manifest_path']).parent
+    source_scope = load_source_scope(args.data_dir, directory=scope_directory)
+    if recorded_source_scope and recorded_source_scope.get('status') == 'available' and (
+            source_scope.get('status') != 'available' or source_scope['manifest_sha256'] != recorded_source_scope['manifest_sha256']):
+        raise ValueError('Resume and official adaptation must retain the recorded source-intervention scope.')
+    if source_scope.get('status') == 'available':
+        if governed_data_sha is not None and source_scope['data_sha256'].get(pool_name) != governed_data_sha:
+            raise ValueError('Source-intervention scope belongs to a different external training arm.')
+        source_scope = dict(source_scope, arm_variant=pool_name)
+    details['source_intervention'] = source_scope
+    if args.phase == 'official':
+        details['actual_source_intervention_exposure'] = external_parent.get('actual_source_intervention_exposure')
     relation_frame = None
     if details.get('relation_data_path'):
         from .q8_supervision import align_anchor_rows
@@ -930,10 +1128,13 @@ def run(args):
     run_dir = args.output_dir / f'{stamp}_{args.phase}_{details["variant"]}_{arm}_f{args.fold}_{uuid4().hex[:6]}'
     run_dir.mkdir(parents=True, exist_ok=False)
     source_files = ('train_lora.py', 'q8_config.py', 'q8_sampling.py', 'q8_supervision.py', 'q8_compute.py',
-                    'q8_observation.py', 'q8_diagnostics.py', 'q8_inner.py', 'q8_fusion.py', 'q8_backend_compare.py', 'q8_stages.py',
+                    'q8_observation.py', 'q8_diagnostics.py', 'q8_inner.py', 'q8_fusion.py', 'q8_crossfit_fusion.py',
+                    'q8_fusion_stability.py', 'q8_evaluation.py', 'q8_cohort_suite.py', 'q8_group_diagnostics.py',
+                    'q8_backend_compare.py', 'q8_stages.py',
                     'q8_exposure.py', 'q8_tokens.py', 'q8_initialization.py',
-                    'q8_checkpoint.py', 'lora_model.py', 'unsloth_model.py', 'liger_model.py')
+                    'q8_checkpoint.py', 'q8_governance.py', 'q8_source_scope.py', 'lora_model.py', 'unsloth_model.py', 'liger_model.py')
     metadata = dict(details, phase=args.phase, fold=args.fold, labels=labels, settings=config,
+                    execution_policy=policy,
                     status='planned', prepared_only=args.plan_only, training_rows=len(frame), validation_rows=len(valid),
                     base=str(args.base.resolve()) if args.base else None, max_updates=args.max_updates,
                     prepared_plan_source=str(prepared.resolve()) if prepared else None,
@@ -950,6 +1151,7 @@ def run(args):
     if resume_metadata:
         metadata['resume_previous_code_sha256'] = resume_metadata['training_code_sha256']
     write_json(run_dir / 'config.json', metadata)
+    write_json(run_dir / 'execution_policy.json', policy)
     # Keep per-row evidence references and independent protocol states in the
     # training artifact; features still come exclusively from frame.text.
     # Large response/prompt bodies remain in the source evidence ledger.
@@ -992,41 +1194,46 @@ def run(args):
     if prepared:
         load_exposure_manifest(prepared, frame, weights, centered_weights, relation_frame,
                                config['centered_weight'], expected_config=config)
-    _, exposure_report = write_exposure_manifest(
+    exposure_ledger, exposure_report = write_exposure_manifest(
         frame, labels, weights, centered_weights, windows_by_epoch, args.max_updates,
         config, run_dir, relation_frame, phase=args.phase, references=references)
-    _, frozen_positions, frozen_report = load_exposure_manifest(
+    del exposure_ledger
+    frozen_ledger, frozen_positions, frozen_report = load_exposure_manifest(
         prepared or run_dir, frame, weights, centered_weights, relation_frame,
         config['centered_weight'], expected_config=config)
+    # These full text-bearing ledgers are already on disk. Do not retain one
+    # in an ignored `_` binding throughout the source experiment's training.
+    del frozen_ledger
     metadata.update(exposure_manifest_sha256=file_sha(run_dir / 'exposure_manifest.json'),
                     actual_exposure_sha256=exposure_report['files']['actual_exposure.parquet'],
                     update_schedule_sha256=exposure_report['files']['update_schedule.parquet'])
+    from .q8_tokens import tokenizer_identity
+    tokenizer_reference = ((prepared_metadata or {}).get('tokenizer_identity')
+                           or (resume_metadata or {}).get('executed_tokenizer_identity'))
     if getattr(args, 'tokenizer', None) is not None:
-        from transformers import AutoTokenizer
-        from .q8_tokens import encode_with_statistics, tokenizer_identity, profile_plan
-        tokenizer = AutoTokenizer.from_pretrained(str(args.tokenizer), local_files_only=True)
-        tokenizer.padding_side = 'right'
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        _, token_stats = encode_with_statistics(tokenizer, frame.text.tolist(), config['max_len'])
-        relation_stats = (encode_with_statistics(tokenizer, relation_frame.text.tolist(), config['max_len'])[1]
-                          if relation_frame is not None else None)
-        profile_plan(frame, token_stats, windows_by_epoch, args.max_updates, config, run_dir,
-                     relation_stats=relation_stats, relation_frame=relation_frame)
-        metadata['tokenizer_identity'] = tokenizer_identity(args.tokenizer, tokenizer)
-        metadata['token_rows_sha256'] = file_sha(run_dir / 'token_rows.parquet')
-        metadata['token_profile_sha256'] = file_sha(run_dir / 'token_profile.json')
-        metadata['planned_token_identity'] = token_rows_identity(token_stats)
-        metadata['planned_relation_token_identity'] = token_rows_identity(relation_stats) if relation_stats is not None else None
-        if prepared and (prepared / 'token_rows.parquet').is_file():
-            columns = ['raw_text_sha256', 'input_ids_sha256', 'raw_tokens', 'input_tokens', 'removed_tokens', 'truncated']
-            old_tokens = pd.read_parquet(prepared / 'token_rows.parquet', columns=columns)
-            if not old_tokens.equals(token_stats[columns]):
-                raise ValueError('Tokenizer inputs or truncation differ from the reviewed plan.')
-            old_relation_path = prepared / 'relation_token_rows.parquet'
-            if relation_stats is not None and (not old_relation_path.is_file() or
-                    not pd.read_parquet(old_relation_path, columns=columns).equals(relation_stats[columns])):
-                raise ValueError('Anchor token inputs differ from the reviewed plan.')
+        requested = tokenizer_identity(args.tokenizer)
+        if tokenizer_reference and requested['files_identity_sha256'] != tokenizer_reference['files_identity_sha256']:
+            raise ValueError('Requested tokenizer files differ from the frozen tokenizer.')
+        if args.plan_only or tokenizer_reference is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(str(args.tokenizer), local_files_only=True)
+            tokenizer.padding_side = 'right'
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            if args.plan_only:
+                measurement = measure_token_inputs(
+                    tokenizer, args.tokenizer, frame, relation_frame, windows_by_epoch,
+                    args.max_updates, config, run_dir, plan_only=True, prepared=prepared,
+                    reference_identity=tokenizer_reference, frozen_metadata=prepared_metadata)
+                metadata.update(measurement[-1])
+                del measurement
+            else:
+                # Fresh --tokenizer requests bind implementation identity only;
+                # all training IDs will come from model.tokenizer after loading.
+                tokenizer_reference = tokenizer_identity(args.tokenizer, tokenizer)
+            del tokenizer
+    if tokenizer_reference:
+        metadata['requested_tokenizer_identity'] = tokenizer_reference
     write_json(run_dir / 'config.json', metadata)
     print(f'Run: {run_dir.resolve()}', flush=True)
     if args.plan_only:
@@ -1062,7 +1269,6 @@ def run(args):
         if config.get('initialization_mode') == 'canonical_backend':
             from .q8_backend_compare import save_backend_initialization as save_initialization
             from .q8_backend_compare import load_backend_initialization as load_initialization
-        from .q8_tokens import encode_with_statistics, tokenizer_identity, profile_plan
         assets = asset_identity(args.base)
         metadata['model_assets'] = assets
         write_json(run_dir / 'base_identity.json', assets['content'])
@@ -1104,35 +1310,12 @@ def run(args):
             metadata['shared_initialization'] = details['external_initialization_config'].get('shared_initialization')
         synchronize_device(model.device)
         model_load_seconds = time.perf_counter() - model_load_start
-        tokens, actual_stats = encode_with_statistics(model.tokenizer, frame.text.tolist(), config['max_len'])
-        relation_tokens, actual_relation_stats = (encode_with_statistics(model.tokenizer, relation_frame.text.tolist(), config['max_len'])
-                                                 if relation_frame is not None else (None, None))
-        columns = ['raw_text_sha256', 'input_ids_sha256', 'raw_tokens', 'input_tokens', 'removed_tokens', 'truncated']
-        planned_token_path = (prepared or run_dir) / 'token_rows.parquet'
-        if planned_token_path.is_file():
-            if not pd.read_parquet(planned_token_path, columns=columns).equals(actual_stats[columns]):
-                raise ValueError('Model tokenizer inputs differ from the frozen actual update plan.')
-        planned_relation_path = (prepared or run_dir) / 'relation_token_rows.parquet'
-        if actual_relation_stats is not None and planned_relation_path.is_file():
-            if not pd.read_parquet(planned_relation_path, columns=columns).equals(actual_relation_stats[columns]):
-                raise ValueError('Model anchor tokenizer inputs differ from the frozen plan.')
-        metadata['executed_token_identity'] = token_rows_identity(actual_stats)
-        metadata['executed_relation_token_identity'] = token_rows_identity(actual_relation_stats) if actual_relation_stats is not None else None
-        actual_tokenizer = tokenizer_identity(args.base, model.tokenizer)
-        expected_tokenizer = (prepared_metadata or metadata).get('tokenizer_identity')
-        if expected_tokenizer and actual_tokenizer['files_identity_sha256'] != expected_tokenizer['files_identity_sha256']:
-            raise ValueError('The actual model tokenizer files differ from the reviewed frozen tokenizer.')
-        if resume_metadata:
-            for key in ('executed_token_identity', 'executed_relation_token_identity'):
-                if metadata[key] != resume_metadata.get(key):
-                    raise ValueError(f'Resume actual tokenizer inputs differ: {key}.')
-            previous_tokenizer = resume_metadata.get('executed_tokenizer_identity') or {}
-            for key in ('files_identity_sha256', 'runtime', 'backend_tokenizer_sha256'):
-                if actual_tokenizer.get(key) != previous_tokenizer.get(key):
-                    raise ValueError(f'Resume tokenizer implementation differs: {key}.')
-        profile_plan(frame, actual_stats, windows_by_epoch, args.max_updates, config, run_dir / 'execution_tokens',
-                     relation_stats=actual_relation_stats, relation_frame=relation_frame)
-        metadata['executed_tokenizer_identity'] = actual_tokenizer
+        tokens, relation_tokens, actual_stats, actual_relation_stats, measurement = measure_token_inputs(
+            model.tokenizer, args.base, frame, relation_frame, windows_by_epoch,
+            args.max_updates, config, run_dir, prepared=prepared,
+            reference_identity=tokenizer_reference, frozen_metadata=prepared_metadata,
+            resume_metadata=resume_metadata)
+        metadata.update(measurement)
         write_json(run_dir / 'config.json', metadata)
         development_evaluator = None
         if details.get('inner_split'):
@@ -1151,28 +1334,45 @@ def run(args):
                     model, inner_fit, inner_dev, labels, split, config, snapshot_dir / 'inner_evaluation',
                     phase=args.phase, training_rows_path=run_dir / 'training_rows.parquet', step=step,
                     centered_trained=any(item['effective_mass'] > 0 for item in centered_evidence),
-                    centered_evidence=centered_evidence)
+                    centered_evidence=centered_evidence,
+                    data_governance=recorded.get('data_governance'),
+                    validation_scope=recorded.get('validation_scope'),
+                    source_intervention=recorded.get('source_intervention'),
+                    actual_source_intervention_exposure=recorded.get('actual_source_intervention_exposure'))
         metrics = train(model, tokens, y, weights, centered_weights,
                         plan, config, args.phase, run_dir, args.max_updates, resume=resume,
-                        checkpoint_every=getattr(args, 'checkpoint_every', 0),
-                        stop_after_updates=getattr(args, 'stop_after_updates', None),
-                        segment_seconds=getattr(args, 'segment_seconds', None), metadata=metadata,
+                        **policy, segment_started_at=segment_started_at, metadata=metadata,
                         relation_tokens=relation_tokens, frozen_positions=frozen_positions,
                         frozen_full_updates=frozen_report['full_planned_updates'],
                         token_stats=actual_stats, relation_token_stats=actual_relation_stats,
                         development_evaluator=development_evaluator)
         metadata['actual_centered_coefficient_mass'] = metrics['actual_centered_coefficient_mass']
+        if metrics.get('actual_source_intervention_exposure') is not None:
+            metadata['actual_source_intervention_exposure'] = metrics['actual_source_intervention_exposure']
         write_json(run_dir / 'config.json', metadata)
         model.save(run_dir)
         evaluation_start = time.perf_counter()
+        final_evaluation_needed = development_evaluator is not None or len(valid) > 0
+        if (not metrics['interrupted'] and final_evaluation_needed and policy['segment_seconds']
+                and evaluation_start - segment_started_at >= policy['segment_seconds']):
+            # The final update is already recoverable. Resume at the same
+            # target cursor to do evaluation without any extra training.
+            metrics.update(interrupted=True, stop_reason='segment_seconds')
+        metrics['final_evaluation_pending'] = bool(
+            final_evaluation_needed and metrics['interrupted']
+            and metrics['successful_updates'] == metrics['target_updates'])
         locked_recipes = None
         if development_evaluator is not None and not metrics['interrupted']:
             metrics['inner_development'] = development_evaluator(run_dir, metrics['successful_updates'])
             if args.phase == 'official':
                 from .q8_fusion import select_recipe, select_calibrated_recipe
                 evidence = json.loads((run_dir / 'inner_evaluation/training_evidence.json').read_text())
-                selector = (select_calibrated_recipe if config.get('fusion_protocol') == 'calibrated_inner_v2'
-                            else select_recipe)
+                if config.get('fusion_protocol') == 'crossfit_calibrated_inner_v3':
+                    from .q8_crossfit_fusion import select_crossfit_calibrated_recipe
+                    selector = select_crossfit_calibrated_recipe
+                else:
+                    selector = (select_calibrated_recipe if config.get('fusion_protocol') == 'calibrated_inner_v2'
+                                else select_recipe)
                 primary = selector(run_dir / 'inner_evaluation', split, evidence, run_dir / 'fusion_primary')
                 calibration = {'calibration': primary['calibration']} if 'calibration' in primary else {}
                 locked_recipes = dict(primary=primary, exclusion_sensitivity=selector(
@@ -1186,6 +1386,7 @@ def run(args):
                     run_dir / f'outer_{name}') for name,recipe in locked_recipes.items()}
         synchronize_device(model.device)
         metrics.update(model_load_seconds=model_load_seconds,
+                       segment_wall_seconds=round(time.perf_counter() - segment_started_at, 3),
                        evaluation_seconds=time.perf_counter() - evaluation_start,
                        timing_scope='Model loading includes asset hashing and common initialization; final evaluation includes inner fusion selection and outer reporting. Intermediate observations are included in training wall time and separately itemized.')
         write_json(run_dir / 'metrics.json', metrics)
@@ -1205,6 +1406,8 @@ def main():
     parser.add_argument('--config', type=Path, default=Path('configs/q8.toml'))
     parser.add_argument('--experiment', help='Named experiment in the Q8 config; defaults to auxiliary for new runs')
     parser.add_argument('--data-dir', type=Path, default=Path('data/q8'))
+    parser.add_argument('--governance-dir', type=Path, help='Immutable governance version; defaults to data-dir/governance, inherited on resume/official adaptation')
+    parser.add_argument('--source-scope-dir', type=Path, help='Immutable measured replacement scope; defaults to data-dir/intervention_scope and is inherited on resume/official adaptation')
     parser.add_argument('--phase', choices=['external', 'official'])
     parser.add_argument('--variant', choices=['baseline', 'mix20', 'matched', 'expanded'])
     parser.add_argument('--centered-plan', choices=['native', 'shared_triplets', 'shared_stratified_triplets',
@@ -1222,9 +1425,10 @@ def main():
     parser.add_argument('--output-dir', type=Path, default=Path('runs'))
     parser.add_argument('--plan-only', action='store_true', help='Analyze real data without loading model weights')
     parser.add_argument('--max-updates', type=int, help='Research budget; remains fixed when resuming a segment')
-    parser.add_argument('--checkpoint-every', type=int, default=0, help='Save after every N successful updates; 0 saves at segment end')
-    parser.add_argument('--stop-after-updates', type=int, help='Stop this segment after N additional updates without changing the research schedule')
-    parser.add_argument('--segment-seconds', type=float, help='Stop at an update boundary after this training-segment duration')
+    parser.add_argument('--checkpoint-every', type=int, help='Recovery cadence in successful updates (default 100); 0 disables this cadence')
+    parser.add_argument('--checkpoint-seconds', type=float, help='Recovery cadence in elapsed seconds (default 900); checked at update boundaries; 0 disables')
+    parser.add_argument('--stop-after-updates', type=int, help='Stop this segment after N additional updates; inherited on resume; 0 clears the cap')
+    parser.add_argument('--segment-seconds', type=float, help='Soft wall-time limit from run entry (default 10800); finish active work then save; 0 disables')
     parser.add_argument('--backend', choices=['hf', 'unsloth', 'liger'])
     parser.add_argument('--forward-batch-rows', type=int)
     parser.add_argument('--optimizer', choices=['adamw', 'loraplus'])
@@ -1242,13 +1446,13 @@ def main():
             parser.error('--fold must be shared, final or 0..4')
         if args.fold not in range(5):
             parser.error('--fold must be shared, final or 0..4')
-    for name in ('max_updates', 'stop_after_updates', 'forward_batch_rows'):
+    for name in ('max_updates', 'forward_batch_rows'):
         if getattr(args, name) is not None and getattr(args, name) < 1:
             parser.error(f'--{name.replace("_", "-")} must be positive')
-    if args.checkpoint_every < 0:
-        parser.error('--checkpoint-every cannot be negative')
-    if args.segment_seconds is not None and (not math.isfinite(args.segment_seconds) or args.segment_seconds <= 0):
-        parser.error('--segment-seconds must be positive and finite')
+    for name in ('checkpoint_every', 'stop_after_updates', 'checkpoint_seconds', 'segment_seconds'):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            parser.error(f'--{name.replace("_", "-")} must be nonnegative and finite')
     run(args)
 
 

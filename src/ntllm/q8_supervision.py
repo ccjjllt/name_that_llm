@@ -216,7 +216,9 @@ def relation_coverage(frame, windows_by_epoch, max_updates=None, labels=None):
     A group contributes each unordered label pair once. Repeated encounters of
     the same two text IDs count toward encounters but not unique_text_pairs.
     The per-class view also counts distinct partner texts and target texts;
-    equal loss mass cannot change any of these quantities.
+    equal loss mass cannot change any of these quantities. Coverage denominators
+    describe the full supplied frame, including for a partial update prefix.
+    These are physical opportunities even when the centered loss is disabled.
     """
     labels = sorted(frame.model.unique()) if labels is None else list(labels)
     if len(set(labels)) != len(labels) or not frame.model.isin(labels).all():
@@ -228,6 +230,26 @@ def relation_coverage(frame, windows_by_epoch, max_updates=None, labels=None):
     ids, models, prompts = (frame[column].to_numpy() for column in ("id", "model", "prompt_id"))
     label_order = {label: index for index, label in enumerate(labels)}
     pairs = [(left, right) for index, left in enumerate(labels) for right in labels[index + 1:]]
+    eligibility_column = next((column for column in ('group_eligible', 'group_is_strong')
+                               if column in frame), None)
+    eligible = None
+    multilabel = None
+    if eligibility_column is not None:
+        eligible = (frame[eligibility_column].fillna(False).to_numpy(dtype=bool)
+                    & frame.prompt_id.fillna('').astype(str).str.strip().ne('').to_numpy())
+        distinct_labels = frame.loc[eligible].groupby('prompt_id').model.nunique()
+        multilabel = eligible & frame.prompt_id.isin(distinct_labels.index[distinct_labels.ge(2)]).to_numpy()
+    supply, partner_available_ids = {}, {}
+    for label in labels:
+        mask = models == label
+        supply[label] = dict(total_rows=int(mask.sum()),
+                             eligible_rows=int((mask & eligible).sum()) if eligible is not None else None,
+                             eligible_multilabel_prompt_rows=(int((mask & multilabel).sum())
+                                                             if multilabel is not None else None),
+                             ineligible_rows=int((mask & ~eligible).sum()) if eligible is not None else None,
+                             eligible_no_other_label_rows=(int((mask & eligible & ~multilabel).sum())
+                                                           if multilabel is not None else None))
+        partner_available_ids[label] = set(ids[mask & multilabel]) if multilabel is not None else None
 
     def new_state():
         return dict(updates=0, groups=0, rows=0, sizes={}, fingerprint=hashlib.sha256(),
@@ -272,14 +294,24 @@ def relation_coverage(frame, windows_by_epoch, max_updates=None, labels=None):
                           unique_right_texts=len(values['right']), unique_prompts=len(values['prompts']))
                      for (left, right), values in state['pairs'].items()]
         return dict(active_updates=state['updates'], centered_groups=state['groups'],
+                    total_rows=len(frame),
+                    eligible_rows=int(eligible.sum()) if eligible is not None else None,
+                    eligible_multilabel_prompt_rows=int(multilabel.sum()) if multilabel is not None else None,
                     centered_row_exposures=state['rows'],
                     centered_unique_texts=sum(len(value['texts']) for value in state['classes'].values()),
+                    physical_centered_coverage=(sum(len(value['texts']) for value in state['classes'].values())
+                                                / len(frame) if len(frame) else 0.0),
                     group_size_counts={str(key): value for key, value in state['sizes'].items()},
                     relation_context_sha256=state['fingerprint'].hexdigest(),
                     possible_label_pairs=len(pairs), observed_label_pairs=sum(row['encounters'] > 0 for row in pair_rows),
                     pair_encounters=sum(row['encounters'] for row in pair_rows),
                     unique_text_pairs=sum(row['unique_text_pairs'] for row in pair_rows),
-                    per_class=[dict(model=label, centered_row_exposures=value['exposures'],
+                    per_class=[dict(model=label, **supply[label],
+                                    physical_centered_coverage=(len(value['texts']) / supply[label]['total_rows']
+                                                                if supply[label]['total_rows'] else 0.0),
+                                    eligible_multilabel_not_centered_rows=(len(partner_available_ids[label] - value['texts'])
+                                                                          if multilabel is not None else None),
+                                    centered_row_exposures=value['exposures'],
                                     centered_unique_texts=len(value['texts']), unique_prompts=len(value['prompts']),
                                     unique_partner_texts=len(value['partner_texts']),
                                     unique_partner_labels=len(value['partner_labels']),
@@ -302,6 +334,10 @@ def relation_coverage(frame, windows_by_epoch, max_updates=None, labels=None):
                     add_group(total, rows, epoch, update, denominator)
         epochs.append(dict(epoch=epoch + 1, **summary(current)))
     return dict(scope="Actual update prefix; physical text and partner support, without loss weighting.",
+                supervision_note="Centered counts describe scheduled relation opportunities, including when lambda=0; they do not establish nonzero auxiliary supervision, gradient contribution or effectiveness.",
+                denominator_note="Coverage uses unique scheduled relation text IDs divided by all rows of the supplied frame, for each epoch/prefix and their deduplicated total.",
+                eligibility_column=eligibility_column,
+                eligibility_note="Eligibility requires the frame's evidence flag and a nonempty prompt. Partner availability requires another eligible label on that prompt in this frame; shared-arm, distinct-row and group-size constraints may further reduce usable coverage. Missing evidence columns produce null supply counts, not inferred eligibility.",
                 pair_direction="Unordered distinct-label pairs; one encounter per text pair within a group.",
                 repeated_text_note="Unique text and pair counts deduplicate across epochs; exposures retain repetitions.",
                 requested_max_updates=max_updates, total=summary(total), epochs=epochs)

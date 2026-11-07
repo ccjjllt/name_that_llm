@@ -99,7 +99,7 @@ def recover_groups(texts, config=None, *, fit_texts=None, fitted=None, return_di
     return groups, record['fallback']
 
 
-def make_cohorts(frame, labels, seeds=(42, 43)):
+def make_cohorts(frame, labels, seeds=(42, 43), imbalance_suite=None):
     """Truth defines stress-sample membership only, never inferred groups."""
     cohorts = [("full", np.arange(len(frame)), dict(kind="full", seed=None))]
     rates = dict(zip(labels, np.linspace(.2, 1., len(labels))))
@@ -116,6 +116,11 @@ def make_cohorts(frame, labels, seeds=(42, 43)):
         cohorts.append((f"class_imbalanced_seed{seed}", np.flatnonzero(keep),
                         dict(kind="class_imbalanced", seed=int(seed), class_retention_probability=rates,
                              interpretation="Prespecified label-dependent stress sampling; not an estimate of hidden-test priors.")))
+    if imbalance_suite is not None:
+        from .q8_cohort_suite import SUITE, make_imbalance_cohorts
+        if imbalance_suite != SUITE:
+            raise ValueError(f'Unknown imbalance suite: {imbalance_suite}.')
+        cohorts.extend(make_imbalance_cohorts(frame, labels, seeds))
     return cohorts
 
 
@@ -167,7 +172,50 @@ def _metrics(rows, labels, probability, baseline=None):
     return result
 
 
-def score_view(rows, labels, log_probability, plain_probability):
+def intervention_label_groups(source_intervention):
+    """Use the measured replacement coverage, never a filename or FOCUS default."""
+    if not source_intervention or source_intervention.get('status') != 'available':
+        return {}
+    summary = source_intervention['summary']
+    return {key: list(summary[key]) for key in ('directly_replaced_labels', 'not_directly_replaced_labels')}
+
+
+def shared_intervention_scope(contexts):
+    """Missing scope stays unrecorded; different measured pairs cannot be pooled."""
+    if not contexts or any(not item or item.get('status') != 'available' for item in contexts):
+        return None
+    if len({item['manifest_sha256'] for item in contexts}) != 1:
+        raise ValueError('Source intervention scopes refer to different paired experiments.')
+    # This is the shared pair definition. Keep each arm's identity in the
+    # original per-run provenance, not on an across-arm comparison header.
+    return {key: value for key, value in contexts[0].items() if key != 'arm_variant'}
+
+
+def score_intervention_groups(rows, labels, probability, source_intervention, baseline=None):
+    """Slice true-label rows while retaining all 18 competing output classes."""
+    groups = intervention_label_groups(source_intervention)
+    if not groups:
+        return {}
+    selected, others = groups.values()
+    if set(selected) & set(others) or set(selected) | set(others) != set(labels):
+        raise ValueError('Intervention label groups must partition the full task labels.')
+    reports = {}
+    for name, members in groups.items():
+        mask = rows.model.isin(members).to_numpy()
+        measured = _metrics(rows.loc[mask], labels, probability[mask], baseline[mask] if baseline is not None else None)
+        present = set(rows.loc[mask, 'model'])
+        measured.update(target_labels=members, target_class_count=len(members),
+                        missing_target_labels=sorted(set(members) - present),
+                        all_target_classes_present=bool(members) and present == set(members),
+                        prediction_scope='Original 18-class probabilities and argmax; only evaluation rows are sliced.',
+                        interpretation=('Directly replaced training-label coverage; not a protocol-only causal effect.'
+                                        if name == 'directly_replaced_labels' else
+                                        'Labels without direct text replacement may still change through shared parameters and inference relations; not an untreated control.'))
+        reports[name] = measured
+    return reports
+
+
+def score_view(rows, labels, log_probability, plain_probability, source_intervention=None):
     probability = np.exp(log_probability)
     report = _metrics(rows, labels, probability, plain_probability)
     lengths = pd.cut(rows.n_words, [-1, 59, 99, 159, np.inf], labels=WORD_BINS)
@@ -179,6 +227,9 @@ def score_view(rows, labels, log_probability, plain_probability):
     for size in sorted(rows.group_size.unique()):
         mask = rows.group_size.eq(size).to_numpy()
         report["by_inferred_group_size"][str(size)] = _metrics(rows.loc[mask], labels, probability[mask], plain_probability[mask])
+    groups = score_intervention_groups(rows, labels, probability, source_intervention, plain_probability)
+    if groups:
+        report['by_source_intervention_label_coverage'] = groups
     return report
 
 
@@ -190,6 +241,33 @@ def _prediction_frame(rows, labels, log_probability):
     for i, label in enumerate(labels):
         result[f"prob__{label}"] = probability[:, i]
     return result
+
+
+def prediction_views(branches, *, centered_available, gaussian_available,
+                     gaussian_noninjective=True):
+    """Named raw-score views, shared by live evaluation and saved-score replay.
+
+    Standalone relation views use that branch alone on active rows and plain
+    on inactive rows. An unavailable branch is omitted, never reported as a
+    measured Gaussian model whose predictions happen to be all plain.
+    """
+    p, c, g = (branches[name] for name in ('plain_lp', 'centered_lp', 'gaussian_lp'))
+    views = dict(plain=p)
+    if centered_available:
+        views['centered_with_plain_fallback'] = np.where(branches['centered_active'][:, None], c, p)
+        views['plain_centered'] = log_softmax(p + .35 * c, axis=1)
+    if gaussian_available:
+        active = branches['gaussian_active'][:, None]
+        views['gaussian_with_plain_fallback'] = np.where(active, g, p)
+        views['plain_gaussian'] = log_softmax(p + .22 * g, axis=1)
+        if gaussian_noninjective:
+            gn = branches['gaussian_noninjective_lp']
+            views['gaussian_noninjective_with_plain_fallback'] = np.where(active, gn, p)
+    if centered_available and gaussian_available:
+        views['plain_centered_gaussian'] = log_softmax(p + .35 * c + .22 * g, axis=1)
+        if gaussian_noninjective:
+            views['plain_centered_gaussian_noninjective'] = log_softmax(p + .35 * c + .22 * gn, axis=1)
+    return views
 
 
 def evaluate_cohorts(fit_frame, query_frame, labels, plain_logits, raw_centered_logits,
@@ -272,24 +350,33 @@ def evaluate_cohorts(fit_frame, query_frame, labels, plain_logits, raw_centered_
     else:
         for filename in ("gaussian_fit.npz", "gaussian_fit.json", "gaussian_query_projection.npy"):
             (output / filename).unlink(missing_ok=True)
-    availability = dict(plain=True, centered=bool(centered_trained), gaussian=gaussian_available)
+    availability = dict(plain=True, centered=bool(centered_trained), gaussian=gaussian_available,
+                        gaussian_noninjective=bool(gaussian_available and options['gaussian_noninjective']))
     unavailable = {}
     if not centered_trained:
         unavailable["centered"] = "No effective centered training; the head is excluded from inference views."
     if not gaussian_available:
         unavailable["gaussian"] = "Same-checkpoint fit/query feature arrays were not supplied."
+    if not availability['gaussian_noninjective']:
+        unavailable['gaussian_noninjective'] = (unavailable['gaussian'] if not gaussian_available
+                                               else 'Noninjective Gaussian evaluation was disabled.')
     fitted_grouping = (fit_grouping_vectorizer(fit.text.tolist(), options)
                        if options['grouping_protocol'] == 'train_fold' else None)
     if fitted_grouping is not None:
         fitted_grouping['diagnostics']['fit_ids_sha256'] = fit_scope['fit_ids_sha256']
     report = dict(scope="One held-out checkpoint fold; grouping uses unlabelled text under the declared vocabulary-fit protocol.",
                   labels=labels, provenance=provenance or {}, fit_scope=fit_scope,
+                  data_governance=(provenance or {}).get('data_governance') or dict(status='unavailable', reason='Source model did not record a governed external-data binding.'),
+                  validation_scope=(provenance or {}).get('validation_scope') or dict(kind='unrecorded', interpretation='Disjoint fit/query prompts alone do not establish independence of upstream data selection or source model identities.'),
+                  source_intervention=(provenance or {}).get('source_intervention') or dict(status='unrecorded'),
+                  actual_source_intervention_exposure=(provenance or {}).get('actual_source_intervention_exposure'),
                   branch_availability=availability, unavailable_reasons=unavailable, head_cache=head_cache,
                   standalone_scale="Fixed divisor 2 for q8 weighted block: softmax(P + .35*C + .22*G). Inactive relation contributions are zero, so singletons equal plain. This is not the complete-system member divisor M.",
+                  standalone_relation_rule="Named *_with_plain_fallback views use only the named branch on active rows, with no fusion coefficient or post-hoc calibration; inactive rows use plain. Gaussian retains its declared internal temperature.",
                   full_system_q8_weights=WEIGHTS, options=options,
                   grouping_fit=(fitted_grouping['diagnostics'] if fitted_grouping else None), cohorts={})
     plain_all = log_softmax(plain_logits, axis=1)
-    cohorts = make_cohorts(query, labels, options["seeds"])
+    cohorts = make_cohorts(query, labels, options["seeds"], options.get('imbalance_suite'))
     requested = options.get("eval_cohorts")
     if requested is not None:
         available = {name for name, _, _ in cohorts} | {spec["kind"] for _, _, spec in cohorts}
@@ -352,34 +439,34 @@ def evaluate_cohorts(fit_frame, query_frame, labels, plain_logits, raw_centered_
         else:
             (cohort_dir / "gaussian_query_projection.npy").unlink(missing_ok=True)
         np.savez_compressed(cohort_dir / "branches.npz", **branches)
-        views = dict(plain=p)
-        if centered_trained:
-            views["centered_with_plain_fallback"] = np.where(centered_active[:, None], c, p)
-            views["plain_centered"] = log_softmax(p + .35 * c, axis=1)
-        if gaussian_available:
-            views["plain_gaussian"] = log_softmax(p + .22 * g, axis=1)
-        if centered_trained and gaussian_available:
-            views["plain_centered_gaussian"] = log_softmax(p + .35 * c + .22 * g, axis=1)
-            if options["gaussian_noninjective"]:
-                views["plain_centered_gaussian_noninjective"] = log_softmax(p + .35 * c + .22 * g_noninjective, axis=1)
+        views = prediction_views(branches, centered_available=centered_trained,
+                                 gaussian_available=gaussian_available,
+                                 gaussian_noninjective=options['gaussian_noninjective'])
         for previous in cohort_dir.glob("*_predictions.parquet"):
             if previous.name.removesuffix("_predictions.parquet") not in views:
                 previous.unlink()
         cohort_report = dict(available=True, scenario=definition, cohort_signature=signature,
                              cohort_membership_signature=membership_signature, grouping_fit=group_fit,
                              cluster_fallback=fallback, grouping=grouping_diagnostics(rows), views={})
+        from .q8_group_diagnostics import grouping_conflict_diagnostics
+        from .q8_cohort_suite import membership_summary
+        cohort_report['relation_conflicts'] = grouping_conflict_diagnostics(rows, labels, branches)
+        cohort_report['membership'] = membership_summary(query, positions, labels)
         for view, lp in views.items():
             if not np.isfinite(lp).all():
                 raise FloatingPointError(f"Nonfinite {view} prediction.")
-            cohort_report["views"][view] = score_view(rows, labels, lp, np.exp(p))
+            cohort_report["views"][view] = score_view(rows, labels, lp, np.exp(p), report['source_intervention'])
             _prediction_frame(rows, labels, lp).to_parquet(cohort_dir / f"{view}_predictions.parquet", index=False)
         cohort_report["centered_active_only"] = (
-            score_view(rows.loc[centered_active], labels, c[centered_active], np.exp(p[centered_active]))
+            score_view(rows.loc[centered_active], labels, c[centered_active], np.exp(p[centered_active]), report['source_intervention'])
             if centered_trained else dict(available=False, reason=unavailable["centered"]))
         manifest = dict(labels=labels, ids=rows.id.astype(str).tolist(), cohort_signature=signature,
                         cohort_membership_signature=membership_signature,
                         scenario=definition, branch_availability=availability, unavailable_reasons=unavailable,
                         available_views=list(views), provenance=provenance or {},
+                        data_governance=report['data_governance'], validation_scope=report['validation_scope'],
+                        source_intervention=report['source_intervention'],
+                        actual_source_intervention_exposure=report['actual_source_intervention_exposure'],
                         fit_scope={**fit_scope, "fit_rows_file": "../fit_rows.parquet"},
                         head_cache={**head_cache, "file": "../head_logits.npz", "query_rows_file": "../query_rows.parquet"},
                         cluster=dict(protocol=options['grouping_protocol'],
@@ -393,7 +480,9 @@ def evaluate_cohorts(fit_frame, query_frame, labels, plain_logits, raw_centered_
                                       inj=True, repel=True, noninjective_sensitivity=bool(options["gaussian_noninjective"]),
                                       fit_parameters_file="../gaussian_fit.npz" if gaussian_available else None,
                                       assumption="At-most-once class evidence is a published modeling assumption, not a guarantee about inferred clusters."),
-                        standalone_scale=report["standalone_scale"], full_system_q8_weights=WEIGHTS)
+                        standalone_scale=report["standalone_scale"],
+                        standalone_relation_rule=report['standalone_relation_rule'], full_system_q8_weights=WEIGHTS)
+        manifest['membership'] = cohort_report['membership']
         _json(cohort_dir / "manifest.json", manifest)
         _json(cohort_dir / "metrics.json", cohort_report)
         report["cohorts"][name] = cohort_report
@@ -437,13 +526,28 @@ def summarize_runs(run_dirs):
     folds = [item["fit_scope"]["query_fold"] for item in indexes]
     if len(set(folds)) != len(folds):
         raise ValueError("More than one run was supplied for a checkpoint fold.")
+    source_scopes = [item.get('source_intervention') for item in indexes]
+    source_intervention = shared_intervention_scope(source_scopes)
+    source_arms = {item.get('arm_variant') for item in source_scopes if item and item.get('arm_variant')}
+    if len(source_arms) > 1:
+        raise ValueError('Pool folds from one source-intervention arm at a time.')
     report = dict(scope="Pooled named-view OOF on each fixed scenario; seeds remain separate sensitivity analyses.",
                   labels=labels, folds=sorted(folds), complete_five_folds=set(folds) == set(range(5)),
                   training_condition_verified=bool(signatures) and all(signatures),
+                  training_condition_verification_scope='Agreement of recorded training-condition signatures only; not independent authentication of source labels, model versions or validation independence.',
                   condition_signature=next((value for value in signatures if value), None),
                   grouping_protocol=protocol_evidence[0]['protocol'],
                   grouping_protocol_evidence=protocol_evidence,
                   evaluation_options=conditions(first, protocol_evidence[0]['protocol'])[1],
+                  data_governance_by_fold={str(fold): item.get('data_governance', dict(status='unavailable'))
+                                           for fold, item in zip(folds, indexes)},
+                  validation_scope_by_fold={str(fold): item.get('validation_scope', dict(kind='unrecorded'))
+                                            for fold, item in zip(folds, indexes)},
+                  source_intervention=source_intervention or dict(status='unrecorded_or_incomplete'),
+                  source_intervention_by_fold={str(fold): scope or dict(status='unrecorded')
+                                               for fold, scope in zip(folds, source_scopes)},
+                  actual_source_intervention_exposure_by_fold={str(fold): item.get('actual_source_intervention_exposure')
+                                                               for fold, item in zip(folds, indexes)},
                   run_dirs=[str(Path(path).resolve()) for path in run_dirs], cohorts={})
     for name in sorted(set().union(*(item["cohorts"] for item in indexes))):
         entries = [item["cohorts"].get(name, {}) for item in indexes]
@@ -498,11 +602,18 @@ def summarize_runs(run_dirs):
                     centered_parts.append(values[mask])
             active = np.concatenate(masks)
             lp = np.concatenate(centered_parts)
-            result = score_view(rows.loc[active], labels, lp, plain[active])
+            result = score_view(rows.loc[active], labels, lp, plain[active], source_intervention)
             result["complete_five_folds"] = report["complete_five_folds"]
             result["descriptive_prompt_bootstrap_95pct_vs_plain"] = (paired_interval(
                 rows.loc[active].assign(true_model=rows.loc[active, "model"]),
                 np.asarray(labels)[plain[active].argmax(1)], np.asarray(labels)[lp.argmax(1)]) if active.any() else None)
+            for group, members in intervention_label_groups(source_intervention).items():
+                subset = rows.loc[active]
+                mask = subset.model.isin(members).to_numpy()
+                result['by_source_intervention_label_coverage'][group]['descriptive_prompt_bootstrap_95pct_vs_plain'] = (
+                    paired_interval(subset.loc[mask].assign(true_model=subset.loc[mask, 'model']),
+                                    np.asarray(labels)[plain[active][mask].argmax(1)], np.asarray(labels)[lp[mask].argmax(1)])
+                    if mask.any() else None)
             combined["centered_active_only"] = result
         for view in sorted(set().union(*(entry["views"] for entry in entries))):
             absent = [fold for fold, entry in zip(folds, entries) if view not in entry["views"]]
@@ -510,10 +621,16 @@ def summarize_runs(run_dirs):
                 combined["views"][view] = dict(complete=False, missing_view_folds=absent)
                 continue
             p = probabilities(view)
-            result = score_view(rows, labels, np.log(np.clip(p, 1e-300, 1)), plain)
+            result = score_view(rows, labels, np.log(np.clip(p, 1e-300, 1)), plain, source_intervention)
             result["complete_five_folds"] = report["complete_five_folds"]
             result["descriptive_prompt_bootstrap_95pct_vs_plain"] = paired_interval(
                 rows.assign(true_model=rows.model), np.asarray(labels)[plain.argmax(1)], np.asarray(labels)[p.argmax(1)])
+            for group, members in intervention_label_groups(source_intervention).items():
+                mask = rows.model.isin(members).to_numpy()
+                result['by_source_intervention_label_coverage'][group]['descriptive_prompt_bootstrap_95pct_vs_plain'] = (
+                    paired_interval(rows.loc[mask].assign(true_model=rows.loc[mask, 'model']),
+                                    np.asarray(labels)[plain[mask].argmax(1)], np.asarray(labels)[p[mask].argmax(1)])
+                    if mask.any() else None)
             combined["views"][view] = result
         report["cohorts"][name] = combined
     return report

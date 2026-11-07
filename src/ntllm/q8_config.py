@@ -6,6 +6,9 @@ import tomllib
 def load_q8_config(path, experiment=None, *, default_experiment=None):
     with Path(path).open('rb') as handle:
         config = tomllib.load(handle)
+    # Recovery cadence and segment limits may change without changing the
+    # scientific recipe or invalidating an existing frozen exposure plan.
+    config.pop('execution', None)
     selected_default = config.pop('default_experiment', None)
     experiments = config.pop('experiments', {})
     if not experiments:

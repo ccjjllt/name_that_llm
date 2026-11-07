@@ -6,17 +6,51 @@ weights are loaded by Q8Classifier before restoring optimizer and RNG state.
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
 import shutil
 import tempfile
 import time
+import tomllib
 
 import numpy as np
 
 
 FORMAT = 'ntllm-q8-training-v1'
+
+# Operational limits are separate from the immutable research settings. Old
+# prepared plans/checkpoints also receive these defaults when first executed.
+EXECUTION_DEFAULTS = dict(checkpoint_every=100, checkpoint_seconds=900.0,
+                          segment_seconds=10800.0, stop_after_updates=None)
+
+
+def execution_policy(config_path=None, saved=None, **overrides):
+    """Resolve defaults < config [execution] < saved policy < explicit options.
+
+    Limits count successful updates / elapsed wall time, never change the
+    optimizer horizon. Zero explicitly disables a time or checkpoint cadence.
+    """
+    policy = dict(EXECUTION_DEFAULTS)
+    if config_path is not None:
+        with Path(config_path).open('rb') as handle:
+            policy.update(tomllib.load(handle).get('execution', {}))
+    policy.update(saved or {})
+    policy.update({key: value for key, value in overrides.items() if value is not None})
+    if policy.keys() != EXECUTION_DEFAULTS.keys():
+        raise ValueError('Unknown execution policy options.')
+    for key in ('checkpoint_every', 'stop_after_updates'):
+        value = policy[key]
+        if key == 'stop_after_updates' and value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f'{key} must be a nonnegative integer.')
+    for key in ('checkpoint_seconds', 'segment_seconds'):
+        value = policy[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f'{key} must be finite and nonnegative.')
+    return policy
 
 
 def save_training_checkpoint(path, model, optimizer, scheduler, scaler, progress, metadata, keep=2):

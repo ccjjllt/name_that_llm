@@ -61,6 +61,10 @@ def _prediction_source(path, view='plain', cohort='full'):
         source.update(evaluation_index=str(index.resolve()),
                       evaluation_index_sha256=hashlib.sha256(content).hexdigest(),
                       evaluation_options=evaluation.get('options', {}),
+                      data_governance=evaluation.get('data_governance', dict(status='unavailable')),
+                      validation_scope=evaluation.get('validation_scope', dict(kind='unrecorded')),
+                      source_intervention=evaluation.get('source_intervention', dict(status='unrecorded')),
+                      actual_source_intervention_exposure=evaluation.get('actual_source_intervention_exposure'),
                       condition_signature=evaluation.get('provenance', {}).get('condition_signature'))
     candidate = path / 'evaluation' / cohort / f'{view}_predictions.parquet'
     if candidate.exists():
@@ -212,6 +216,30 @@ def compare(paths_a, paths_b, fractions, view='plain', cohort='full'):
                   folds=fold_metrics,
                   baseline_runs=[str(path.resolve()) for path in paths_a],
                   candidate_runs=[str(path.resolve()) for path in paths_b], mixtures=[])
+    from .q8_evaluation import shared_intervention_scope, intervention_label_groups, score_intervention_groups
+    source_intervention = shared_intervention_scope([source.get('source_intervention')
+                                                     for source in first_sources + second_sources])
+    report['source_intervention'] = source_intervention or dict(status='unrecorded_or_incomplete')
+    if source_intervention:
+        arm_roles = {name: sorted({(source.get('source_intervention') or {}).get('arm_variant', 'unrecorded')
+                                   for source in sources})
+                     for name, sources in (('baseline', first_sources), ('candidate', second_sources))}
+        report['source_intervention_comparison'] = dict(
+            arm_variants=arm_roles,
+            declared_pair_order=arm_roles == dict(baseline=['baseline'], candidate=['mix20']),
+            interpretation='Data scope identifies the intended replacement. Matching initialization, training recipe and completed exposure require separate execution evidence; subgroup scores do not establish protocol reliability or per-replacement causal yield.')
+        evaluation_rows = rows.rename(columns={'true_model': 'model'})
+        before = score_intervention_groups(evaluation_rows, labels, first_probability, source_intervention)
+        after = score_intervention_groups(evaluation_rows, labels, second_probability, source_intervention)
+        grouped = {}
+        for group, members in intervention_label_groups(source_intervention).items():
+            mask = rows.true_model.isin(members).to_numpy()
+            grouped[group] = dict(baseline=before[group], candidate=after[group],
+                paired=outcomes(rows.loc[mask], first[mask], second[mask]),
+                descriptive_prompt_bootstrap_95pct=(paired_interval(rows.loc[mask], first[mask], second[mask])
+                                                   if mask.any() else None),
+                uncertainty_scope='Prompt-paired descriptive interval conditional on fitted models; not training-seed uncertainty or a protocol-only causal estimate.')
+        report['by_source_intervention_label_coverage'] = grouped
     for fraction in fractions:
         if not 0 <= fraction <= 1:
             raise ValueError('Mixture fractions must be in [0, 1].')

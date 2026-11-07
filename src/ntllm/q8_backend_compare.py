@@ -284,6 +284,10 @@ def _inner_quality(path, config, successful_updates):
     return dict(status='verified_inner_dev', role='inner_dev', split_sha256=split['split_sha256'],
                 content_sha256=split['inner_dev']['content_sha256'], rows=len(rows),
                 checkpoint_updates=successful_updates, membership=membership,
+                data_governance=report.get('data_governance', dict(status='unavailable')),
+                validation_scope=report.get('validation_scope', dict(kind='unrecorded')),
+                source_intervention=report.get('source_intervention', dict(status='unrecorded')),
+                actual_source_intervention_exposure=report.get('actual_source_intervention_exposure'),
                 evaluation_options=report['options'], full_views=report['cohorts']['full']['views'],
                 outer_labels_used=False)
 

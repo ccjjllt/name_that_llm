@@ -44,7 +44,13 @@ fused_adamw = false
 checkpoint_keep = 2
 require_shared_initialization = true
 
-# 固定 baseline 的关系文本，仅替换 plain-only 槽；保留原来源对照条件。
+[execution]
+checkpoint_every = 100
+checkpoint_seconds = 900
+segment_seconds = 10800
+
+# 固定关系的四类局部文本替换；source/mix20 为兼容别名，非可靠/未知协议对照。
+# 保留 baseline 关系文本，仅替换 plain-only 槽；科学设置与原计划一致。
 [experiments.source]
 centered_plan = "anchored_triplets"
 

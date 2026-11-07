@@ -1,0 +1,66 @@
+# 独立融合稳健性研究；不替换既有冻结 auxiliary/source 计划。
+# 4折prompt温度交叉拟合；保持11权重候选；增加80个预声明类别偏斜布局。
+keep = 24
+layers = [2, 4, 6, 8, 12, 16, 20, 24]
+max_len = 384
+r = 16
+alpha = 32
+lora_dropout = 0.05
+attention_implementation = "sdpa"
+gradient_checkpointing = true
+external_epochs = 2
+official_epochs = 2
+external_lr = 0.0001
+external_head_lr = 0.001
+official_lr = 5e-05
+official_head_lr = 0.0005
+batch_size = 3
+accumulation = 6
+weight_decay = 0.01
+warmup_fraction = 0.1
+head_dropout = 0.1
+gradient_clip = 1.0
+centered_plan = "grouped_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0
+class_balance = true
+matching_strength = 0.5
+seed = 42
+eval_batch_size = 8
+eval_gaussian = true
+eval_grouping_protocol = "train_fold"
+eval_cluster_threshold = 0.15
+eval_cohort_seeds = [42, 43]
+device = "auto"
+dtype = "auto"
+backend = "hf"
+forward_batch_rows = 3
+optimizer = "adamw"
+fused_adamw = false
+checkpoint_keep = 2
+require_shared_initialization = true
+research_inner_validation = true
+inner_outer_fold = 0
+inner_seed = 42
+inner_dev_fraction = 0.2
+external_snapshot_updates = [100, 500, 1000, 2000, 5000, 10000, 13242, 20000, 26484]
+snapshot_official_epochs = true
+gradient_diagnostic_updates = [1, 100, 500, 2000, 10000, 20000, 26484]
+initialization_mode = "canonical_backend"
+fusion_protocol = "crossfit_calibrated_inner_v3"
+eval_imbalance_suite = "rotating_v1"
+
+[execution]
+checkpoint_every = 100
+checkpoint_seconds = 900
+segment_seconds = 10800
+
+[supervision.external]
+centered_plan = "grouped_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0
+
+[supervision.official]
+centered_plan = "shared_stratified_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0
