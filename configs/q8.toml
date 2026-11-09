@@ -1,4 +1,4 @@
-# Q8 共用模型与优化参数。当前实验只在文件末尾声明差异。
+# Q8 共用模型与优化参数。所有当前实验在文件末尾声明差异。
 # 新训练默认 auxiliary；来源数据准备默认 source；短程基准只读共用参数。
 default_experiment = "auxiliary"
 
@@ -77,3 +77,65 @@ centered_weight = 1.0
 centered_plan = "shared_stratified_triplets"
 centered_balance = "class_mass"
 centered_weight = 1.0
+
+# centered 外部／官方阶段开关。off 只关闭损失，物理批次和随机数消费不变。
+[experiments.off_off]
+extends = "auxiliary"
+
+[experiments.off_off.supervision.external]
+centered_plan = "grouped_triplets"
+centered_balance = "class_mass"
+centered_weight = 0.0
+
+[experiments.off_off.supervision.official]
+centered_plan = "shared_stratified_triplets"
+centered_balance = "class_mass"
+centered_weight = 0.0
+
+[experiments.off_on]
+extends = "auxiliary"
+
+[experiments.off_on.supervision.external]
+centered_plan = "grouped_triplets"
+centered_balance = "class_mass"
+centered_weight = 0.0
+
+[experiments.off_on.supervision.official]
+centered_plan = "shared_stratified_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0
+
+[experiments.on_off]
+extends = "auxiliary"
+
+[experiments.on_off.supervision.external]
+centered_plan = "grouped_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0
+
+[experiments.on_off.supervision.official]
+centered_plan = "shared_stratified_triplets"
+centered_balance = "class_mass"
+centered_weight = 0.0
+
+[experiments.on_on]
+extends = "auxiliary"
+
+[experiments.global_on]
+extends = "auxiliary"
+
+[experiments.global_on.supervision.external]
+centered_plan = "grouped_triplets"
+centered_balance = "global_mass"
+centered_weight = 1.0
+
+[experiments.global_on.supervision.official]
+centered_plan = "shared_stratified_triplets"
+centered_balance = "class_mass"
+centered_weight = 1.0
+
+# 独立融合研究候选，不修改已冻结 auxiliary/source 计划。
+[experiments.fusion_robustness]
+extends = "auxiliary"
+fusion_protocol = "crossfit_calibrated_inner_v3"
+eval_imbalance_suite = "rotating_v1"

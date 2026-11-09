@@ -156,7 +156,7 @@ def prepare(reference_index, config_path, out):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference-index', type=Path, default=Path('runs/scale_preparation_20261107/summary.json'))
-    parser.add_argument('--config', type=Path, default=Path('configs/centered_reference.toml'))
+    parser.add_argument('--config', type=Path, default=Path('configs/q8.toml'))
     parser.add_argument('--output-dir', type=Path, default=Path('runs/centered_reference_20261107/preparation'))
     args = parser.parse_args()
     prepare(args.reference_index, args.config, args.output_dir)

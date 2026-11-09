@@ -16,6 +16,17 @@ from scipy.special import softmax
 KEYS = ['prompt_id', 'fold', 'true_model', 'n_words']
 
 
+def validate_fold_predictions(prediction, official, fold, source):
+    """Check the exact in-memory prediction snapshot selected for scoring."""
+    expected = official.set_index('id').sort_index()
+    expected = expected.loc[expected.fold.eq(fold), ['prompt_id', 'fold', 'model', 'n_words']]
+    expected = expected.rename(columns={'model': 'true_model'})
+    selected = prediction.set_index('id').sort_index()
+    if (not selected.index.is_unique or not selected.index.equals(expected.index)
+            or not np.array_equal(selected[KEYS].to_numpy(), expected[KEYS].to_numpy())):
+        raise ValueError(f'{source}: predictions do not cover exactly the recorded held-out fold.')
+
+
 def infer_grouping_protocol(evaluation, manifest):
     """Resolve explicit protocol metadata or a documented historical fit scope.
 

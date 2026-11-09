@@ -18,7 +18,15 @@ def load_q8_config(path, experiment=None, *, default_experiment=None):
     selected = experiment or default_experiment or selected_default
     if selected == 'base':
         return config
-    if selected not in experiments:
-        raise ValueError(f'Unknown Q8 experiment {selected!r}; choose from {list(experiments)}.')
-    # Stage tables are complete declarations, not recursive inheritance.
-    return {**config, **experiments[selected]}
+    def resolve(name, parents=()):
+        if name not in experiments:
+            raise ValueError(f'Unknown Q8 experiment {name!r}; choose from {list(experiments)}.')
+        if name in parents:
+            raise ValueError(f'Circular Q8 experiment inheritance: {(*parents, name)}.')
+        overrides = dict(experiments[name])
+        parent = overrides.pop('extends', None)
+        # Stage tables remain complete declarations, not recursive merging.
+        inherited = resolve(parent, (*parents, name)) if parent else {}
+        return {**inherited, **overrides}
+
+    return {**config, **resolve(selected)}
