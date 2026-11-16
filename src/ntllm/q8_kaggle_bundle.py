@@ -85,18 +85,41 @@ def build_catalog(root=PROJECT):
         job_id = external_id if external else f"{external_id}_fold{item['fold']}"
         add(job_id, "source", item["prepared_plan"], "source", None if external else external_id,
             item["updates"])
-    if len(jobs) != 40 or len(tokenizers) != 1:
-        raise ValueError(f"Expected 40 jobs and one tokenizer; got {len(jobs)} / {len(tokenizers)}.")
+
+    # 第41件：full 部署适配器（无留出，不参与 OOF 与内层选权）。
+    full_plan = root / "runs/q8_full_20261115/plans/on_on_full/official_final"
+    full_configs = sorted(full_plan.glob("*/config.json"))
+    full_updates = 0
+    if full_configs:
+        if len(full_configs) != 1:
+            raise ValueError(f"Expected one full plan under {full_plan}; got {len(full_configs)}.")
+        metadata = _read(full_configs[0])
+        full_updates = metadata["supervision"]["active_updates"]
+        add("on_on_full", "on_on_full", full_configs[0].parent, "auxiliary", "centered_class",
+            full_updates)
+
+    expected_jobs = 41 if full_configs else 40
+    if len(jobs) != expected_jobs or len(tokenizers) != 1:
+        raise ValueError(f"Expected {expected_jobs} jobs and one tokenizer; got {len(jobs)} / {len(tokenizers)}.")
     first, second = centered["planned_budget"], scale["source"]
+    full_budget = dict(row_exposures=0, input_tokens=0, padded_tokens=0)
+    if full_configs:
+        profile = _read(full_configs[0].parent / "token_profile.json")
+        full_budget = dict(row_exposures=profile["plain"]["row_exposures"],
+                           input_tokens=profile["forward"]["input_tokens"],
+                           padded_tokens=profile["forward"]["padded_tokens"])
     budget = dict(
-        training_stages=len(jobs), updates=first["optimizer_updates"] + second["updates"],
-        exposures=first["row_exposures"] + second["exposures"],
-        input_tokens=first["input_tokens"] + second["input_tokens"],
-        padded_tokens=first["padded_tokens"] + second["padded_tokens"],
+        training_stages=len(jobs), updates=first["optimizer_updates"] + second["updates"] + full_updates,
+        exposures=first["row_exposures"] + second["exposures"] + full_budget["row_exposures"],
+        input_tokens=first["input_tokens"] + second["input_tokens"] + full_budget["input_tokens"],
+        padded_tokens=first["padded_tokens"] + second["padded_tokens"] + full_budget["padded_tokens"],
     )
-    if sum(job["updates"] for job in jobs.values()) != budget["updates"]:
-        raise ValueError("Catalog updates differ from the existing preparation summaries.")
     for job_id, job in jobs.items():
+        if job_id == "on_on_full":
+            if job["reference"]["settings"]["research_inner_validation"] or \
+                    job["reference"]["settings"]["fusion_protocol"] != "inner_prompt_fusion_v1":
+                raise ValueError("on_on_full must disable inner validation and calibrated fusion.")
+            continue
         settings = load_q8_config(root / "configs/q8.toml", job["profile"])
         settings.setdefault("loraplus_ratio", 16.0)
         parent = jobs[job["parent"]]["reference"] if job["parent"] else None

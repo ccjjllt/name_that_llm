@@ -139,3 +139,9 @@ centered_weight = 1.0
 extends = "auxiliary"
 fusion_protocol = "crossfit_calibrated_inner_v3"
 eval_imbalance_suite = "rotating_v1"
+
+# 第6件：full官方适配器（无留出部署件，不参与OOF对比与内层选权）。
+[experiments.on_on_full]
+extends = "auxiliary"
+research_inner_validation = false
+fusion_protocol = "inner_prompt_fusion_v1"
