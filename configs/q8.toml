@@ -1,5 +1,4 @@
-# Q8 共用模型与优化参数。所有当前实验在文件末尾声明差异。
-# 新训练默认 auxiliary；来源数据准备默认 source；短程基准只读共用参数。
+# Q8 共用模型与优化参数。新训练默认 auxiliary，短程基准只读共用参数。
 default_experiment = "auxiliary"
 
 keep = 24
@@ -49,12 +48,7 @@ checkpoint_every = 100
 checkpoint_seconds = 900
 segment_seconds = 10800
 
-# 固定关系的四类局部文本替换；source/mix20 为兼容别名，非可靠/未知协议对照。
-# 保留 baseline 关系文本，仅替换 plain-only 槽；科学设置与原计划一致。
-[experiments.source]
-centered_plan = "anchored_triplets"
-
-# 扩展池完整两轮的 class/global 对照；官方阶段固定。
+# 外部和官方阶段采用 class_mass 的 centered 辅助。
 [experiments.auxiliary]
 centered_plan = "grouped_triplets"
 research_inner_validation = true
@@ -78,67 +72,8 @@ centered_plan = "shared_stratified_triplets"
 centered_balance = "class_mass"
 centered_weight = 1.0
 
-# centered 外部／官方阶段开关。off 只关闭损失，物理批次和随机数消费不变。
-[experiments.off_off]
-extends = "auxiliary"
-
-[experiments.off_off.supervision.external]
-centered_plan = "grouped_triplets"
-centered_balance = "class_mass"
-centered_weight = 0.0
-
-[experiments.off_off.supervision.official]
-centered_plan = "shared_stratified_triplets"
-centered_balance = "class_mass"
-centered_weight = 0.0
-
-[experiments.off_on]
-extends = "auxiliary"
-
-[experiments.off_on.supervision.external]
-centered_plan = "grouped_triplets"
-centered_balance = "class_mass"
-centered_weight = 0.0
-
-[experiments.off_on.supervision.official]
-centered_plan = "shared_stratified_triplets"
-centered_balance = "class_mass"
-centered_weight = 1.0
-
-[experiments.on_off]
-extends = "auxiliary"
-
-[experiments.on_off.supervision.external]
-centered_plan = "grouped_triplets"
-centered_balance = "class_mass"
-centered_weight = 1.0
-
-[experiments.on_off.supervision.official]
-centered_plan = "shared_stratified_triplets"
-centered_balance = "class_mass"
-centered_weight = 0.0
-
 [experiments.on_on]
 extends = "auxiliary"
-
-[experiments.global_on]
-extends = "auxiliary"
-
-[experiments.global_on.supervision.external]
-centered_plan = "grouped_triplets"
-centered_balance = "global_mass"
-centered_weight = 1.0
-
-[experiments.global_on.supervision.official]
-centered_plan = "shared_stratified_triplets"
-centered_balance = "class_mass"
-centered_weight = 1.0
-
-# 独立融合研究候选，不修改已冻结 auxiliary/source 计划。
-[experiments.fusion_robustness]
-extends = "auxiliary"
-fusion_protocol = "crossfit_calibrated_inner_v3"
-eval_imbalance_suite = "rotating_v1"
 
 # 第6件：full官方适配器（无留出部署件，不参与OOF对比与内层选权）。
 [experiments.on_on_full]

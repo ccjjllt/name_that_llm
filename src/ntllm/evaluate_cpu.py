@@ -328,7 +328,7 @@ def summarize(output, labels):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=Path("data/q8/official.parquet"))
+    parser.add_argument("--data", type=Path, default=Path("data/q8_protocol/official.parquet"))
     parser.add_argument("--output", type=Path, default=Path("runs/cpu_evaluation"))
     parser.add_argument("--dimensions", type=int, default=128)
     parser.add_argument("--head-c", type=float, default=2.0)

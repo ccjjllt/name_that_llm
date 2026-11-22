@@ -1,6 +1,6 @@
 """Shared-prompt Gaussian group head (ported, Apache-2.0, from public Kaggle notebooks by prvsiyan / kirilltym / sangam21).
 Two-way model x = class mean + prompt effect + noise; exact (n<=3) or cavity-EM (n>3) injective group marginals.
-Project copy of runs/public_scan_20261105/generated/gauss.py; dimensions and finite inputs checked here."""
+The port checks feature dimensions and finite inputs."""
 import itertools
 import numpy as np
 K = 18

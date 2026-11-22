@@ -964,7 +964,7 @@ def run(args):
             setattr(args, name, saved)
         if args.base is None and resume_metadata.get('base'):
             args.base = Path(resume_metadata['base'])
-        if args.data_dir == Path('data/q8'):
+        if args.data_dir is None:
             args.data_dir = Path(resume_metadata['data_path']).parent
     elif prepared_metadata is not None:
         config = dict(prepared_metadata['settings'])
@@ -973,7 +973,7 @@ def run(args):
             if requested is not None and requested != saved:
                 raise ValueError(f'Frozen plan requires {name}={saved!r}; prepare a new experiment to change it.')
             setattr(args, name, saved)
-        if args.data_dir == Path('data/q8'):
+        if args.data_dir is None:
             args.data_dir = Path(prepared_metadata['data_path']).parent
         if args.init is None and prepared_metadata.get('initialization_run'):
             args.init = Path(prepared_metadata['initialization_run'])
@@ -988,6 +988,8 @@ def run(args):
                 raise ValueError(f'Frozen plan cannot change {name}.')
     else:
         config = load_q8_config(args.config, getattr(args, 'experiment', None))
+        if args.data_dir is None:
+            args.data_dir = Path('data/q8_protocol')
         if args.phase is None:
             raise ValueError('Choose --phase external/official, or supply --resume.')
         args.fold = args.fold if args.fold is not None else 'shared'
@@ -1129,7 +1131,7 @@ def run(args):
     run_dir.mkdir(parents=True, exist_ok=False)
     source_files = ('train_lora.py', 'q8_config.py', 'q8_sampling.py', 'q8_supervision.py', 'q8_compute.py',
                     'q8_observation.py', 'q8_diagnostics.py', 'q8_inner.py', 'q8_fusion.py', 'q8_crossfit_fusion.py',
-                    'q8_fusion_stability.py', 'q8_evaluation.py', 'q8_cohort_suite.py', 'q8_group_diagnostics.py',
+                    'q8_evaluation.py', 'q8_cohort_suite.py', 'q8_group_diagnostics.py',
                     'q8_backend_compare.py', 'q8_stages.py',
                     'q8_exposure.py', 'q8_tokens.py', 'q8_initialization.py',
                     'q8_checkpoint.py', 'q8_governance.py', 'q8_source_scope.py', 'lora_model.py', 'unsloth_model.py', 'liger_model.py')
@@ -1405,7 +1407,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('configs/q8.toml'))
     parser.add_argument('--experiment', help='Named experiment in the Q8 config; defaults to auxiliary for new runs')
-    parser.add_argument('--data-dir', type=Path, default=Path('data/q8'))
+    parser.add_argument('--data-dir', type=Path,
+                        help='Prepared data directory; defaults to data/q8_protocol for new runs and the saved path otherwise')
     parser.add_argument('--governance-dir', type=Path, help='Immutable governance version; defaults to data-dir/governance, inherited on resume/official adaptation')
     parser.add_argument('--source-scope-dir', type=Path, help='Immutable measured replacement scope; defaults to data-dir/intervention_scope and is inherited on resume/official adaptation')
     parser.add_argument('--phase', choices=['external', 'official'])

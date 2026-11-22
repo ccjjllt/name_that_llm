@@ -47,7 +47,7 @@ def _transitions(left, right, columns):
 def build_source_scope(data_dir, *, exposure=None, out=None):
     """Bind actual differences and declared anchor exposure without editing data.
 
-    ``exposure`` is the real anchor slot table used by q8_protocol_controls.
+    ``exposure`` is the saved table of planned anchor slots for the comparison.
     Existing pairs read that table from their parent directory. It is a plan,
     not evidence that a model has executed those successful updates.
     """

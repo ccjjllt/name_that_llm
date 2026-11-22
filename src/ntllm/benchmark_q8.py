@@ -31,7 +31,7 @@ def canonical_parameters(model):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', type=Path, required=True)
-    parser.add_argument('--data-dir', type=Path, default=Path('data/q8'))
+    parser.add_argument('--data-dir', type=Path, default=Path('data/q8_protocol'))
     parser.add_argument('--config', type=Path, default=Path('configs/q8.toml'))
     parser.add_argument('--experiment', help='Optional named experiment; default uses shared model settings only')
     parser.add_argument('--backend', choices=['hf', 'unsloth', 'liger'], default='hf')
