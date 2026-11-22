@@ -18,9 +18,24 @@
 
 在新前缀的固定融合权重下，把候选从 587 条扩到各折前 30%（809 条），用量从 87,409 增到 119,002 个 token 位置，balanced accuracy 都是 **0.6968**。两个 GLM 的召回各增 3.33 个百分点，同时 Claude Opus 4.8 降 2.67 个百分点，Opus 4.6 和 Opus 5 各降 1.33，Fable 和 Sonnet 5 各降约 0.67。继续增加覆盖的收益取决于能否减少这批候选中将 Claude 改判为 GLM 的错误。[五折指标 JSON](../runs/glm_user_prefix_20261121/glm_user_prefix_metrics.json)
 
+在各折 GLM 总概率前 30% 的候选中，比较纯概率排序与加入 25% 预期改判收益排名的排序。用真实 160-token 似然轨迹计算融合后的改判，收益标签在各外折的训练侧按题目交叉拟合，排序只使用运行似然前的分数和文本长度。在相同预算下，两种排序的 balanced accuracy 均为 **0.69683**。新排序改对两条、改错两条，五折一升、三平、一降，两路正文与前缀合计用量从 173,698 降到 173,582 个 token。保留纯 GLM 总概率排序。[Kaggle 排序对照](https://www.kaggle.com/code/zhuating/ntl-glm-prefix-learned-routing/versions/1) · [指标 JSON](../runs/glm_prefix_learned_routing_20261122/v1/glm_prefix_learned_routing_metrics.json)
+
 在固定的 587 条上，另拟合两个低维校准头，将族间间隔与 GLM 两型号的分差向原融合值收缩。用于拟合校准头的 GLM 分数在每个外折的训练侧交叉拟合，Native 沿用固定的折外参考。加入两个校准头，balanced accuracy 从 **0.69683 到 0.69720**，不足 100 词的回答从 0.60352 到 0.60421。五折两升、两平、一降，变化来自族间校准。把同一组头应用到 809 条候选，仍有上述 GLM 召回与 Claude 召回的取舍。混合版沿用原融合权重。[Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-glm-prefix-residual-calibration) · [指标 JSON](../runs/glm_prefix_calibration_20261121/output/glm_prefix_calibration_metrics.json)
 
 固定同样的 587 条候选、Fable 回转阈值和 0.15 的字形概率乘数，复现 mathleteutd 的选择性概率交接。对于字形步骤前仍判为 GLM 或触发 Fable 回转的行，改由似然后的分数驱动字形规则。在 2,699 条 Native＋GLM 折外回答上，改动产生 **0 次改判**，五折均持平，balanced accuracy 为 **0.69460**，不足 100 词的回答为 0.60280。这里加入了 Apex 残差、Fable 回转和字形步骤，输入仍是 Native 单成员的折外分数。[公开变体 v5](https://www.kaggle.com/code/mathleteutd/name-that-llm-320-token-glm-fable-typography/versions/5) · [Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-glm-fable-typography-ab/versions/1) · [指标 JSON](../runs/glm_fable_typography_20261121/glm_fable_typography_metrics.json)
+
+### 缩短正文窗口的代价
+
+从低推理力度与用户前缀的真实轨迹重新汇总特征，按原折拟合每个窗口的分类头。四种窗口使用同一批 587 条候选、同一顺序和融合权重。160 token 重算精确复现总体与逐折指标。表中是两路合计的正文 token，各档还使用相同的 34,100 个前缀 token。[Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-glm-prefix-window-study/versions/2) · [完整指标 JSON](../runs/glm_prefix_window_20261121/v2/glm_prefix_window_metrics.json)
+
+| 正文窗口 | Balanced accuracy | 不足 100 词 | 两路正文 token | 正文节省 |
+|---:|---:|---:|---:|---:|
+| 160 | **0.69683** | 0.60352 | 139,598 | 0% |
+| 128 | 0.69460 | **0.60569** | 123,804 | 11.3% |
+| 96 | 0.68978 | 0.60365 | 102,738 | 26.4% |
+| 64 | 0.67680 | 0.59183 | 74,282 | 46.8% |
+
+128 token 的总体分数低 0.22 个百分点，四折下降、一折持平。两个 GLM 的召回各降 0.67 个百分点，Fable 召回降 2.68 个百分点。公开双 T4 的两批分段计时由 115,980 增至 290,068 个位置，Flash 与 Full 合计的每位置时间增量为约 0.033 秒。以相同候选比例外推到 4,000 条，128、96、64 token 预计分别腾出约 6、15、26 分钟，固定权重加载开销仍存在。当前保持 160 token，待 Kimi 有真实计时和准确率再比较是否值得交换这段预算。[800 条的公开计时](https://www.kaggle.com/code/estopadilla/ntl-glm-prefix-ab/versions/1/output) · [1,899 条的公开计时](https://www.kaggle.com/code/estopadilla/ntl-glm-prefix-ab/versions/2/output)
 
 ## GLM 后验保留与候选选择
 
@@ -112,12 +127,28 @@ Kimi K3 的公开编码器把助手推理和可见正文放在 `think` 与 `resp
 
 200 条已覆盖 360 条方案可纠正的 50 条错误中的 41 条，估计 token 数约为其 54%。125 条方案中，Kimi 与 GPT-5.5 的双向混淆占 24 条可纠正错误中的 11 条。词数换算得到的 token 数只用于比较开销，增幅是所有可改判行都改对时的上限，实际收益仍取决于量化 Kimi 似然。[Kaggle 选样对照](https://www.kaggle.com/code/zhuating/ntl-kimi-route-budget) · [指标 JSON](../runs/kimi_route_budget_20261121/kimi_route_budget.json)
 
+单空格前缀的双 T4 实验评分了 **360 条回答、37,183 个正文 token**。23 段总用时 **55 分 29 秒**，其中权重加载约 17 分钟、计算约 38 分钟，另有一次编译。入选行的 Native 间隔 AUC 为 0.7952，独立 Kimi 似然特征的折外 AUC 为 0.4792。加入 0.25 或 0.50 权重，总体 balanced accuracy 分别从 **0.68721** 到 0.68499 和 0.68536。[Kimi GPU 对照](https://www.kaggle.com/code/zhuating/ntl-kimi-real-likelihood/versions/3) · [指标 JSON](../runs/kimi_real_likelihood_20261121/v3/kimi_real_likelihood_metrics.json)
+
+用同一批实际轨迹，按相同候选排序比较 125、200、360 条回答以及 64、128 token 窗口。200 条、64 token、0.25 权重的最高结果是 **0.68758**，只净改对一条，五折两升、两平、一降，不足 100 词的回答提高 0.20 个百分点。其余窗口和候选数组合均低于原判决。直接使用单空格似然暂未显示稳定收益。配对实验沿用同一批回答和正文 token，比对官方格式的空 `think` 加 `response`。挂载的 GGUF 词表已确认四个结构标记，最短正文前缀为 31 token，单空格为 1 token。[Kaggle CPU 窗口对照](https://www.kaggle.com/code/zhuating/ntl-kimi-window-tradeoff/versions/1) · [指标 JSON](../runs/kimi_window_tradeoff_20261121/v1/kimi_window_tradeoff.json) · [Kimi 前缀配对实验](https://www.kaggle.com/code/zhuating/ntl-kimi-response-likelihood/versions/1)
+
+31-token 前缀在同一批 37,183 个正文 token 上用时 **64 分 25 秒**，比单空格多 8 分 56 秒。两种绝对似然特征的折外 AUC 分别为 0.4792（单空格）和 0.4415（正文通道）。在逐 token 的对数似然差上取均值、标准差与首末 32 token 的变化，AUC 提高到 **0.6024**。该差分以同一篇正文作参照，检验改变上下文对正文概率的影响。0.50 权重下，合并 Native 的 AUC 从 0.7952 到 0.8051，balanced accuracy 从 **0.68721 到 0.68795**，改对 5 条、改错 3 条，五折三升、一降、一平。两次独立评分合计约两小时，现有榜单候选仍采用 GLM 与冻结 Native 的组合。[Kaggle 配对结果](https://www.kaggle.com/code/zhuating/ntl-kimi-prefix-pair/versions/1) · [指标 JSON](../runs/kimi_prefix_pair_20261121/v1/kimi_prefix_pair_metrics.json) · [生成式似然比方法](https://proceedings.neurips.cc/paper/2019/hash/1e79596878b2320cac26dd792a6c51c9-Abstract.html)
+
+将校准训练扩大到其余四个 prompt 折，每次用 288 条拟合、72 条评估。沿用同一批样本、三个特征组合和融合权重，单空格、正文通道、差分的独立 AUC 分别为 0.4942、0.5325、**0.6137**。差分以 0.50 权重合并时，balanced accuracy 从 **0.68721 到 0.68832**，Kimi 召回从 57.33% 到 60.67%，改对 6 条、改错 3 条，五折两升、两平、一降。完整用时与较小的整体增益使其暂不适合占用榜单推理预算。[Kaggle 校准复核](https://www.kaggle.com/code/zhuating/ntl-kimi-prefix-pair/versions/2) · [指标 JSON](../runs/kimi_prefix_pair_20261121/v2/kimi_prefix_pair_metrics.json)
+
+同一新前缀折外对照中，Qwen3.8-Max 召回为 **121/150**，Kimi 为 **86/150**。若只纠正各自漏判，总 balanced accuracy 的理论增幅分别为 **1.07** 和 **2.37** 个百分点。Qwen 同源公开量化权重在 Kaggle 的五组镜像共 693.14 GB，普通 GGUF 分片只覆盖 16 片中的前 15 片，缺末片约 37.5 GB。按层执行还需重新打包并处理 Gated DeltaNet 和注意力状态衔接。结合可修正量和准备成本，先测 Kimi。[五折指标 JSON](../runs/glm_user_prefix_20261121/glm_user_prefix_metrics.json) · [Qwen 模型卡](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [Kaggle 镜像说明](https://www.kaggle.com/datasets/ggayoayogg/qwen38-24t-ud-iq2xs-5) · [Unsloth 文件表](https://huggingface.co/unsloth/Qwen3.8-2.4T-A95B-GGUF/tree/main/UD-IQ2_XS)
+
 ### 评分时间的来源
 
 公开 0.701 同系集成在 597 条真实回答的运行中，Qwen3-14B 的固定训练前向与高斯拟合约 453 秒，Qwen3-8B 对应部分约 130 秒，GSQ 测试阶段用时约 541 秒。这是公开运行的耗时，0.711 私测规模仍需单独测量。两个高斯头的拟合只使用官方训练集，可以移到评分前。隐藏测试的表征、聚类和组内中心化仍在评分中计算。[597 条运行日志](https://www.kaggle.com/code/tianyialexlyu/ntl-0701-rehearsal/log) · [575 条运行日志](https://www.kaggle.com/code/yujiehe0925/ntl-0701-rehearsal-v1cover-s11/log)
 
 公开资产已有按早期 v27 代码拟合的同名高斯头，部分前向配置与 0.711 有差别。0.711 v21 与 0.716 v5 的 q14v5、q8v5 前向和高斯拟合代码一致。两者都按同一顺序合并及撤销 FP16 适配器、以同一官方训练集和题目组拟合，并用相同的 WPCA 维度和协方差配置。按 v21 精确计算的参数可以用于两版，前提是对应成员的权重与设备布局一致。测试中出现 BF16 重算或 q8v5 退回单副本时，按原路径重算该成员的训练前向和拟合。[已有高斯参数](https://www.kaggle.com/datasets/lightningv08/ntl-olmo2-native24-final-inference-assets) · [预计算实现](../src/ntllm/prefit_gauss.py)
 
+在 Kaggle 双 T4 上用 2,699 条官方回答实际预拟合。Q14 训练前向 **484.9 秒**、WPCA 和高斯拟合 **9.8 秒**，没有 BF16 重算。Q8 的双副本加载因显存不足退回跨卡单副本，训练前向 256.7 秒、拟合 10.6 秒。0.716 预计算候选只加载 Q14 的参数。**8 分 15 秒**是本次移出的训练计算实测值，评分中的实际节省还取决于权重路径和测试时是否触发重算。[Kaggle 预拟合日志](https://www.kaggle.com/code/zhuating/ntl-l24-gaussian-heads/versions/1/log)
+
 从两次公开运行分别扣除 GSQ 的 110 秒和 69 秒权重准备，将其余耗时按 4,000 条线性外推，含权重准备约为 50–53 分钟。正文长度与挂载速度会改变实际结果。GSQ 在 0.711 占 3% 权重，去掉它的准确率代价需要通过同配置对照测量。Kimi 分段的读取与计算耗时确定后，再比较是否值得用这段时间替换 GSQ。[597 条运行日志](https://www.kaggle.com/code/tianyialexlyu/ntl-0701-rehearsal/log) · [575 条运行日志](https://www.kaggle.com/code/yujiehe0925/ntl-0701-rehearsal-v1cover-s11/log)
 
 两份公开方案在当前分段的 GPU 前向期间预读下一段到系统页缓存。Flash 与 Full 最大相邻两段分别合计 **41.62 GiB** 和 **28.80 GiB**。GLM 作者在约 29 GB 内存的双 T4 上观察到单段加载加快，同时进程间等待约 60 秒，端到端时间没有下降。0.716 的单批动态裁尾支持该预取，但现有公开运行未量化这一组合的完整耗时，混合版沿用 0.716 的默认设置。[预取实现](https://www.kaggle.com/code/lbjyang/ntl-700-fixed160-prefetch) · [320-token 公开变体](https://www.kaggle.com/code/mathleteutd/name-that-llm-320-token-glm-fable-typography) · [GLM 作者计时](https://www.kaggle.com/code/estopadilla/0-689-real-glm-5-3-likelihood-on-2xt4)
+
+两次公开运行中，Comp 先完成 GLM4-9B 表征与分类头，随后按模型类型和 hidden size 选择 Qwen3-8B。排序首个匹配是只包含配置的 `lora24/final/base_config`，加载失败后整个 15% 的 Comp 项被跳过，已耗时 **1,711** 和 **1,729 秒**。0.716 作者记录的 1,200 条公开运行也有该问题。另一个版本按实际权重文件筛选路径，504 条运行完成 Comp，用时 3,614 秒。前两次结果估计了在同样缺权重条件下可回收的时间，成功运行只验证了该版本的推理可用性。[597 条失败日志](https://www.kaggle.com/code/tianyialexlyu/ntl-0701-rehearsal/log) · [575 条失败日志](https://www.kaggle.com/code/yujiehe0925/ntl-0701-rehearsal-v1cover-s11/log) · [504 条成功日志](https://www.kaggle.com/code/sigmatango/ntl-pub696-timing/log) · [0.716 作者记录](https://www.kaggle.com/code/estopadilla/0-716-robust-glm-5-3-likelihood-user-prefix)
+
+独立的 Comp 修复候选沿用 504 条公开对照的模型选择条件，针对按类型匹配的路径要求实际权重并排除 embedding 与 GGUF。保持 0.716 v5 的 15% Comp 权重与下游 GLM 时限。候选的榜单对照检验新增 Comp 流水线的准确率收益，以及它占用的时间对 GLM 覆盖的净影响。[候选生成器](../src/ntllm/comp_checkpoint_notebook.py)

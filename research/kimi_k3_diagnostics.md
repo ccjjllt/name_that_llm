@@ -96,3 +96,7 @@ balanced accuracy 的每类权重是 1/18，每类约 150 行，所以**修正�
 - `runs/kaggle_c_20261116/output/results_c.json`（全部诊断数值，69KB）
 - `runs/kaggle_c_20261116/output/sep_oof_scores.parquet`（逐行 kimi 分数）
 - `runs/kaggle_c_20261116/output/ntl-c-kimi-diag.log`（运行日志，181 秒）
+
+## 7. Qwen3.5 读出后的 Kimi 候选范围（2026-11-22）
+
+在 Qwen3.5 DC＋AC 0.20、Low 160-token GLM、Apex 硬字形和 Fable 恢复的固定五折回放中复现了 BA 0.70313。150 条真实 Kimi 漏判 63 条，字形处理后有 30 条的前三仍含 Kimi，其中 5 条受原 GLM 或 Fable 保护。实际可重排的只有 **25/63 条**，其中 **13 条首选 GPT-5.5**，其次为 Qwen3.8-max（4 条）和 GPT-5.6-terra（2 条）。相反方向的 41 条误判为 Kimi 的回答中，有 22 条真类在可调整的前三，其中 10 条的真类是 GPT-5.5。GPT-5.5 是两侧最集中的竞争者。多数 Kimi 漏判超出这项重排的范围，实验止于诊断。[Kaggle 对照](https://www.kaggle.com/code/zhuating/ntl-glm-reader-kimi-pair/versions/1) · [指标 JSON](../runs/glm_reader_kimi_pair_20261122/v1/glm_reader_kimi_pair_metrics.json)

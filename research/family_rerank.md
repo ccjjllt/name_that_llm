@@ -109,3 +109,56 @@
 - `runs/kaggle_a2_20261116/output/results_a2.json`（组级实验完整结果）
 - `src/ntllm/family_rerank.py`、`src/ntllm/group_rerank.py`
 - `runs/kaggle_a_20261116/run_a.py`、`runs/kaggle_a2_20261116/run_a2.py`
+
+## 8. Claude 短片段的外部同题迁移（2026-11-22）
+
+用独立 Claude API 数据中的 1,000 道新题、4,998 条回答，按题拟合五个 Claude 型号之间的十组成对判别头，每对有 998–1,000 个题组。特征为相邻功能词的身份及其间其他词数的分桶，从外部回答中间最多 80 个词提取。判别方向仅用外部样本训练，官方五折的训练侧短回答只用于估计分数中心。固定 Native 折外分数、Low 用户前缀的 160-token GLM 后验及其原融合参数。仅在不足 100 词、首选为 Claude 且前三至少有两个 Claude 候选时，以 0.15 权重在同族候选之间重分配概率。[Claude API 数据](https://www.kaggle.com/datasets/seyitkaangunes/ntl-extra-api-passages) · [Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-claude-anchor-pairs/versions/1)
+
+2,699 条官方回答的 balanced accuracy 从 **0.69683 到 0.69720**。355 条短 Claude 回答从 **0.61269 到 0.61621**，改对两条、改错一条，五折一升、一降、三平。Fable 短回答召回仍为 0.4189。138 条短 Claude 错误中，53 条首选已落到 Claude 族外，只有 64 条满足重排条件且真类在前三。
+
+外部信号在官方短回答上可区分部分型号。Opus 4.6 对 Opus 5 的 AUC 为 0.726，Fable 对 Opus 5 和 Sonnet 5 分别为 0.653 和 0.652，Fable 对 Opus 4.8 为 0.562。现有结果不足以把这项重排加入集成。[指标 JSON](../runs/claude_anchor_pairs_20261122/output/claude_anchor_pairs_metrics.json)
+
+## 9. Gemini Flash 的句位与尾段转折（2026-11-22）
+
+两项对照都使用 Native＋GLM 的 `family_mass_glm_posterior` 折外概率，沿用官方 2,699 条回答、150 个题目和五折。首选属于 Gemini 3.7/3.8 Flash，且前三候选同时含有两者时才重排。固定证据权重 0.15，共命中 294 行。其中 93 行原首选错误且真值是同组另一候选，全部修正的全量均衡准确率上限为 +3.44 个百分点。[折外概率来源](https://www.kaggle.com/code/zhuating/ntl-glm-likelihood-dynamics)
+
+句位对照使用 2,237 个 Gemini 3.7/3.8 Flash 的真实 Vertex 同题组（A 组 290、C 组 1,947）。两模型回答相同的用户请求且响应回传的模型名与标签一致。比较原风格汇总、句级特征均值（DC）、以及加入按相对句位加权的第一余弦分量（AC1）。配对头仅使用外部样本拟合。句级特征包括句长、标点、词形以及句首尾的功能词。[公开配对数据](https://www.kaggle.com/datasets/davidpiln/ntl-vertex-gemini-gen) · [句位对照](https://www.kaggle.com/code/zhuating/ntl-gemini-sentence-order/versions/1) · [指标 JSON](../runs/gemini_sentence_order_20261122/output/gemini_sentence_order.json)
+
+尾段对照复用冻结 Qwen3-8B-Base 在官方训练文本上的第 4、6、8、22 层特征。缓存只保存末 32 和末 64 个有效 token 的均值。使用两个均值和有效 token 数恢复末 32 个 token 与其前相邻片段的差，再比较单独的末 64 均值与拼接该差分的特征。每折只使用另外四折的 120 个同题 Gemini 对拟合。[公开缓存](https://www.kaggle.com/datasets/lightningv08/ntl-olmo2-native24-final-inference-assets) · [尾段对照](https://www.kaggle.com/code/zhuating/ntl-gemini-tail-contrast/versions/1) · [指标 JSON](../runs/gemini_tail_contrast_20261122/output/gemini_tail_contrast.json)
+
+| 证据 | 全量 BA | Gemini Flash 双类 BA | Gemini 双类 AUC | 改对 / 改错 |
+|---|---:|---:|---:|---:|
+| 原判决 | 0.68721 | 0.5600 | 0.6651 | 0 / 0 |
+| 原风格汇总，Vertex A/C | 0.68832 | 0.5700 | 0.6728 | 5 / 2 |
+| 句均 DC | 0.68795 | 0.5667 | 0.6720 | 4 / 2 |
+| 句均 DC ＋ AC1 | 0.68684 | 0.5567 | 0.6714 | 1 / 2 |
+| Qwen 尾段 DC | 0.68350 | 0.5267 | 0.6629 | 9 / 19 |
+| Qwen 尾段 DC ＋差分 | 0.68388 | 0.5300 | 0.6669 | 6 / 15 |
+
+尾段差分把官方同题排序准确率从 73.3% 提高到 75.3%，但实际改判四折下降、一折持平，少于 100 词和更长回答的双类 BA 分别下降 1.25 和 5.49 个百分点。原风格汇总的小幅增益全来自 3.8 Flash，两折升、一折降、两折平。先前冻结 Native 末 token 与三段差分的独立双类 AUC 分别为 0.6425、0.5755，也低于原概率差的 0.6651。当前实测支持保留原判决。[冻结 Native 对照](../runs/native_frozen_siblings_20261121/output/native_frozen_siblings.json)
+
+## 10. 冻结 Qwen3.5 的全类来源特征（2026-11-22）
+
+将 READER 的单条回答方法用到比赛数据。冻结 Qwen3.5-9B，从第 18 层提取回答前 384 个 token 的末 token、均值（DC）与首个零均值余弦分量（AC）。在官方四折训练 18 类逻辑回归，留出一折打分，保留相同的五个 prompt 分组。独立读出的 BA 为末 token 0.36227、DC 0.42413、DC＋AC 0.40230。对固定的 Native＋GLM 折外分数加入 0.20 的 DC＋AC 后，BA 从 **0.68721 到 0.69351**，2,699 条回答改对 67 条、改错 50 条。提取与拟合用约 378 秒，两张 T4 处理不同回答。[READER 论文](https://arxiv.org/abs/2606.10794v3) · [Kaggle 五折](https://www.kaggle.com/code/zhuating/ntl-reader-qwen3-5-attribution/versions/1) · [指标 JSON](../runs/reader_qwen35_20261122/v1/reader_qwen35_metrics.json)
+
+进一步固定 Low 用户前缀的 160-token GLM，只在原 Apex 族内重排之后、硬字形过滤之前融合 20% 的读出分数。GLM 保留原 587 条候选及原获胜保护。Mirza v7 在字形过滤后恢复 32 条 GLM 似然阶段改判为 Fable 的回答，单独使用时改对 12 条、改错 3 条，使 Fable 召回从 35.57% 到 43.62%。[Mirza v7](https://www.kaggle.com/code/mzishran/name-that-llm-glm-and-claude-fable/versions/7) · [Fable 五折对照](https://www.kaggle.com/code/zhuating/ntl-glm-fable-v7-restore/versions/1)
+
+| Qwen3.5 特征 | Padilla 规则 | 加 Fable 恢复 | 加恢复后不足 100 词 |
+|---|---:|---:|---:|
+| 无 | 0.69124 | 0.69461 | 0.60280 |
+| DC | 0.69865 | 0.70165 | **0.61419** |
+| DC＋AC | **0.70013** | **0.70313** | 0.61216 |
+
+在 Fable 恢复规则下加入 DC＋AC，改对 68 条、改错 45 条，五折四升一平。相对两项改动加入前，组合高 **1.19 个百分点**。这些结果使用固定 Native 折外分数模拟集成。候选使用 DC＋AC 与 Fable 恢复，隐藏集仍需正式提交评估。[Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-glm-reader-apex-ab/versions/1) · [指标 JSON](../runs/glm_reader_apex_ab_20261122/v1/glm_reader_apex_ab_metrics.json) · [组合方案](https://www.kaggle.com/code/zhuating/ntl-0716-reader-qwen35/versions/1)
+
+运行 Qwen3.5 前，用原 Apex 的最高两类分差选择最难判的回答，排除 V1 判为 GLM 的回答和触发 Fable 恢复的行。在覆盖全部回答的 30%、50%、70% 三档中，整体 BA、五折分数和各长度段分数均与全量 Qwen3.5 的 **0.70313** 一致。50% 档的改判也是同样的 150 条，按正文字符数估计的 token 位置为全量的 **46.0%**。30% 档用量为 26.9%，少改判一条，净正确数仍相同。选择 50% 档给隐藏集的候选保留余量，实际推理耗时仍需在比赛运行中测量。[Kaggle 分差对照](https://www.kaggle.com/code/zhuating/ntl-glm-reader-margin-budget/versions/1) · [指标 JSON](../runs/glm_reader_margin_budget_20261122/v1/glm_reader_margin_budget_metrics.json) · [50% 组合方案](https://www.kaggle.com/code/zhuating/ntl-0716-reader-qwen35-margin50/versions/1)
+
+另用公开的冻结 Qwen3-8B 末 64 个 token 均值检验主题正则化。每个训练折用同题回答均值估计共享主题方向，并在 18 类逻辑回归中增加沿这些方向变化的惩罚。留出折逐条打分。独立读出的 BA 从 0.42562 到 0.42636。以相同 0.20 权重加入 Native＋GLM 后，两版均为 **0.68869**，正则化后的短文 BA 从 0.59939 到 0.59783。该对照保留原特征。[Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-prompt-invariant-readout/versions/1) · [指标 JSON](../runs/prompt_invariant_readout_20261122/v1/prompt_invariant_readout.json)
+
+在相同的 2,699 条回答、五个 prompt 折、Low 前缀 GLM 和 Fable 恢复下，用同一 Qwen3.5 DC＋AC 特征，在每折的训练侧以同题回答之差拟合 GPT-5.6 和 Gemini 3.7/3.8 Flash 的四个成对方向。固定 0.15 权重，仅在加入 Qwen3.5 证据前的前三名中重排同族候选。成对分数单用时，BA 从 0.69461 到 0.69720（改对 23 条、改错 16 条）。叠加到已有的 0.20 全类读出后，BA 从 **0.70313 降至 0.70128**（改对 13 条、改错 18 条，五折一升一平三降）。四对分数与全类读出的相应分差相关性为 0.673–0.842，成对 AUC 均低于全类读出。保留全类方案。[Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-glm-reader-pair-ab/versions/1) · [指标 JSON](../runs/glm_reader_pair_ab_20261122/v1/glm_reader_pair_ab_metrics.json)
+
+在同一回放中固定 DC＋AC 权重为 0.20，在原 GLM 保护、字形和 Fable 恢复之前逐族补偿 logsumexp，使六个家族恢复到加入读出前的概率质量。整体 BA 从全局融合的 **0.70313 降至 0.70053**，短回答从 0.61216 降至 0.61079。按改判前后预测的家族划分，全局融合的同族改判改对 56 条、改错 40 条，跨族改对 12 条、改错 5 条。保持质量后对应为 55/40 与 3/2。全局融合对真实 Claude 和 GPT 的族内净修正分别为 11 和 9 条，跨族再净修正 3 和 1 条。真实 Gemini 的族内净减少 5 条，跨族净修正 1 条，保持质量后的 Gemini BA 仍为 0.67833。这项限制损失了大部分跨族净增益，保留全局融合。[Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-glm-reader-family-mass/versions/1) · [指标 JSON](../runs/glm_reader_family_mass_20261122/v1/glm_reader_family_mass_metrics.json)
+
+用同一次 Qwen3.5 前向的末 token 与 DC＋AC 读出，在同一低前缀和 Apex 回放中固定 0.20 总权重。DC＋AC 单用为 **0.70313**，末 token 单用为 **0.69980**，各占 0.10 时为 **0.70461**，相对纯 DC＋AC 改对 33 条、改错 29 条。等权组合五折两升、两平、一降，短文下降 0.184 个百分点，长文上升 0.553 个百分点。三个变体的全量与低分差 50% 预测逐行一致。比赛候选继续使用纯 DC＋AC。[Kaggle CPU 对照](https://www.kaggle.com/code/zhuating/ntl-glm-reader-terminal-ab/versions/1) · [指标 JSON](../runs/glm_reader_tail_ab_20261122/v1/glm_reader_tail_ab_metrics.json)
+
+在同一次冻结 Qwen3.5-9B 前 18 层前向中提取第 8、13、18 层的 DC＋AC，每层用同一组官方 prompt 五折和原 `C=16` 拟合。原 Low160、Apex 和 Fable 恢复保持一致，READER 总权重固定为 0.20。第 18 层复算与既有存档的 2,699 条最终预测逐行相同，BA 为 **0.70313**。第 8、13 层分别为 **0.70090、0.69905**，三层 logits 等权平均为 **0.70387**，相对第 18 层改对 24 条、改错 22 条，五折两升、一平、两降，短文 BA 从 0.61216 降至 0.61123。各变体在全量与原低分差 50% 覆盖下预测逐行一致。保留第 18 层读出和原低分差 50% 覆盖。[Kaggle 双 T4 对照](https://www.kaggle.com/code/zhuating/ntl-reader-qwen35-depth-ab/versions/2) · [指标 JSON](../runs/reader_qwen35_depth_ab_20261122/v2/reader_qwen35_depth_ab_metrics.json)
