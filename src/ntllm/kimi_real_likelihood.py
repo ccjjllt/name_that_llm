@@ -198,6 +198,12 @@ def features(value):
     ]
 
 
+def fit_calibrator(values, truths):
+    return make_pipeline(
+        StandardScaler(), LogisticRegression(C=0.4, class_weight="balanced", max_iter=300)
+    ).fit(values, truths)
+
+
 def crossfit(values, truths, folds, prompts):
     model_log_odds = np.empty(len(values), dtype=float)
     for fold in np.unique(folds):
@@ -208,21 +214,18 @@ def crossfit(values, truths, folds, prompts):
             if len(np.unique(truths[fit])) < 2:
                 model_log_odds[holdout] = 0.0
                 continue
-            model = make_pipeline(
-                StandardScaler(), LogisticRegression(C=0.4, class_weight="balanced", max_iter=300)
-            )
-            model.fit(values[fit], truths[fit])
+            model = fit_calibrator(values[fit], truths[fit])
             model_log_odds[holdout] = model.decision_function(values[holdout])
     return model_log_odds
 
 
-def evaluate(frame, labels, logits, chosen, values, margin):
+def evaluate(frame, labels, logits, chosen, values, margin, *, calibrate=crossfit):
     kimi = labels.index(KIMI)
     truth = pd.Categorical(frame.model, categories=labels).codes
     original = logits.argmax(axis=1)
     chosen_truth = truth[chosen] == kimi
     fold = frame.fold.to_numpy()
-    odds = crossfit(values, chosen_truth, fold[chosen], frame.prompt_id.to_numpy()[chosen])
+    odds = calibrate(values, chosen_truth, fold[chosen], frame.prompt_id.to_numpy()[chosen])
     result = {
         "selected_rows": len(chosen), "kimi_rows": int(chosen_truth.sum()),
         "auc_reference": roc_auc_score(chosen_truth, margin[chosen]),
