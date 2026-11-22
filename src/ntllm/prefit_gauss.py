@@ -1,14 +1,18 @@
 """Move the public q14v5/q8v5 Gaussian support fit out of scoring."""
 
+import argparse
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
 from textwrap import indent
+from zipfile import BadZipFile
 
 import numpy as np
 
 
 MEMBERS = ('q14v5', 'q8v5')
+PREFIT_ASSET = 'zhuating/ntl-l24-gaussian-heads'
 ARRAYS = ('mx', 'sx', 'W', 'm', 'lam')
 FIT_CONFIG = dict(red='wpca', d=128, se_shrink='lw', sp_shrink='lw', lam_floor=0.0001,
                   n_exact=3, inj=True, iters=5, repel=True, sp_scale=1.0)
@@ -45,11 +49,19 @@ def save_support(root, identity, params, redo_batches, feature_seconds, fit_seco
 
 def read_support(root, identity):
     path = Path(root) / f"{identity['member']}.npz"
-    with np.load(path, allow_pickle=False) as archive:
-        meta = json.loads(archive['metadata'].item())
-        if meta['identity'] != identity:
-            raise ValueError(f'Gaussian support in {path} differs from the current inputs')
-        params = {key: archive[key] for key in ARRAYS}
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            meta = json.loads(archive['metadata'].item())
+            if meta['identity'] != identity or meta['cfg'] != FIT_CONFIG or (meta['T1'], meta['Tg']) != (3.0, 3.0):
+                raise ValueError(f'Gaussian support in {path} differs from the current inputs')
+            params = {key: archive[key] for key in ARRAYS}
+    except (BadZipFile, TypeError) as error:
+        raise ValueError(f'Invalid Gaussian support in {path}') from error
+    d = FIT_CONFIG['d']
+    width = params['mx'].size
+    shapes = {'mx': (width,), 'sx': (width,), 'W': (width, d), 'm': (len(identity['labels']), d), 'lam': (d,)}
+    if not all(a.shape == shapes[key] and a.dtype.kind == 'f' and np.isfinite(a).all() for key, a in params.items()):
+        raise ValueError(f'Invalid Gaussian parameters in {path}')
     return {**params, 'cfg': meta['cfg'], 'T1': meta['T1'], 'Tg': meta['Tg']}, meta['bf16_redo_batches']
 
 
@@ -67,6 +79,7 @@ def patch_infer(source):
                             "sp_shrink='lw', lam_floor=0.0001, n_exact=3", 1)
     source = replace_once(source, 'a = p.parse_args()\n', '''p.add_argument('--gauss_prefit_out', default='')
 p.add_argument('--gauss_prefit_in', default='')
+p.add_argument('--gauss_prefit_members', default='q14v5,q8v5')
 a = p.parse_args()
 if a.gauss_prefit_out and a.gauss_prefit_in:
     p.error('choose either Gaussian support preparation or loading')
@@ -131,7 +144,7 @@ failed = []
         prm['T1'] = prm['Tg'] = 3.0
 ''', '''        import gauss as _ga
         prm = None
-        if a.gauss_prefit_in and spec['name'] in MEMBERS:
+        if a.gauss_prefit_in and spec['name'] in MEMBERS and spec['name'] in a.gauss_prefit_members.split(','):
             try:
                 prm, support_redos = read_support(a.gauss_prefit_in, support_identity(spec, train, LABELS))
             except (OSError, ValueError, KeyError) as error:
@@ -150,3 +163,62 @@ failed = []
             _q = _ga.scores(Ztr_g[[0, 1]], np.zeros(2, dtype=int), prm)
             assert np.allclose(np.exp(_q).sum(1), 1)
 ''')
+
+
+def deployment_notebook(notebook, members=MEMBERS, skip_config_only_comp=False):
+    """Add optional support files to the original estopadilla v5 inference cell."""
+    result = deepcopy(notebook)
+    cells = result['cells']
+    worker = next(i for i, cell in enumerate(cells) if ''.join(cell['source']).startswith('%%writefile infer.py\n'))
+    command = next(cell for cell in cells if ''.join(cell['source']).startswith('LAYERS = [2, 4, 6, 8, 12, 16, 20, 24]'))
+    marker, original = ''.join(cells[worker]['source']).split('\n', 1)
+    cells[worker]['source'] = marker + '\n' + patch_infer(original)
+    asset = PREFIT_ASSET.split('/')[-1]
+    find_cache = f'''from pathlib import Path
+gauss_prefit_members = {tuple(members)!r}
+gauss_prefit_roots = (Path('/kaggle/input/notebooks/{PREFIT_ASSET}/prefit_gauss'),
+                      Path('/kaggle/input/{asset}/prefit_gauss'))
+gauss_prefit = next((root for root in gauss_prefit_roots
+                    if any((root / f'{{member}}.npz').is_file() for member in gauss_prefit_members)), None)
+if gauss_prefit is not None:
+    cmd += ['--gauss_prefit_in', str(gauss_prefit), '--gauss_prefit_members', ','.join(gauss_prefit_members)]
+    print('Gaussian support input:', gauss_prefit, flush=True)
+'''
+    command['source'] = replace_once(''.join(command['source']), 'if FAST_COMMIT:\n', find_cache + 'if FAST_COMMIT:\n')
+    cells.insert(worker, {'cell_type': 'code', 'metadata': {}, 'execution_count': None, 'outputs': [],
+                          'source': '%%writefile prefit_gauss.py\n' + Path(__file__).read_text()})
+    if skip_config_only_comp:
+        comp = next(cell for cell in cells if ''.join(cell['source']).startswith('%%writefile comp_stack.py\n'))
+        comp['source'] = replace_once(''.join(comp['source']), '\ndef load_truncated_decoder(', '''
+if not SMOKE:
+    qwen_path = find_checkpoint('qwen3', 4096)
+    if (qwen_path and qwen_path.endswith('/lora24/final/base_config')
+            and os.listdir(qwen_path) == ['config.json']):
+        print(f'Comp cannot load the selected Qwen3 checkpoint: {qwen_path}', flush=True)
+        raise SystemExit(1)
+
+
+def load_truncated_decoder(''')
+    for cell in cells:
+        if cell['cell_type'] == 'code':
+            cell['execution_count'] = None
+            cell['outputs'] = []
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=f'Attach {PREFIT_ASSET} v1 in Kaggle.')
+    parser.add_argument('--public-0716', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--members', nargs='+', choices=MEMBERS, default=MEMBERS)
+    parser.add_argument('--skip-config-only-comp', action='store_true',
+                        help='Skip Comp if its original Qwen3 selector finds the known config-only checkpoint.')
+    args = parser.parse_args()
+    notebook = json.loads(args.public_0716.read_text())
+    patched = deployment_notebook(notebook, args.members, args.skip_config_only_comp)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(patched, ensure_ascii=False, indent=1) + '\n')
+
+
+if __name__ == '__main__':
+    main()
