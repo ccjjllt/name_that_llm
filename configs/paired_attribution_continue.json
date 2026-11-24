@@ -1,0 +1,10 @@
+{
+  "seed": 24,
+  "holdout_seed": 23,
+  "steps": 1080,
+  "pairs_per_batch": 8,
+  "max_tokens": 256,
+  "eval_batch": 24,
+  "learning_rate": 0.00015,
+  "holdout_max_per_class": 120
+}
