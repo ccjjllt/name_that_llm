@@ -6,17 +6,20 @@
 
 | 本队提交 | 公开榜 BA | 记录 |
 |---|---:|---|
-| Mirza v5 原样复现 | **0.717** | [58692158](../runs/public_0717_mirza_20261122/submission.json) |
+| Sibling Odds v1 原样复现 | **0.720** | [58768811](../runs/public_0720_sibling_odds_20261123/submission.json) |
+| Dennis Guarded Fable v1 原样复现 | 0.718 | [58754662](../runs/atlas_0719_20261123/official_comparison.json) |
+| Dennis Guarded Fable v1 + ATLAS | 0.718 | [58768879](../runs/atlas_0719_20261123/official_comparison.json) |
+| Mirza v5 原样复现 | 0.717 | [58692158](../runs/public_0717_mirza_20261122/submission.json) |
 | Padilla v5 原样复现 | 0.716 | [58659450](../runs/public_0716_20261121/submission.json) |
 | Padilla v5 加 Qwen3.5 READER 与 Fable 恢复 | 0.707 / 0.707 | [全量](../runs/l0716_reader_qwen35_20261122/competition_submission.json) · [低分差 50%](../runs/l0716_reader_qwen35_margin50_20261122/competition_submission.json) |
 
-此前的复现为 0.668 → 0.680 → 0.684 → 0.696 → 0.702 → 0.709 → 0.711。榜单基线采用 Mirza v5，其代码和挂载集合与 Padilla v5 一致，离线 T4 镜像不同。历史折外回放中的 Native 或 Native＋GLM 分数只用于同输入对照。[Mirza v5](https://www.kaggle.com/code/mzishran/name-that-llm-glm-and-claude-fable?scriptVersionId=372138390) · [Padilla v5](https://www.kaggle.com/code/estopadilla/0-716-robust-glm-5-3-likelihood-user-prefix?scriptVersionId=371376285)
+此前的复现为 0.668 → 0.680 → 0.684 → 0.696 → 0.702 → 0.709 → 0.711。Mirza v5 的代码和挂载集合与 Padilla v5 一致，离线 T4 镜像不同。历史折外回放中的 Native 或 Native＋GLM 分数只用于同输入对照。[Mirza v5](https://www.kaggle.com/code/mzishran/name-that-llm-glm-and-claude-fable?scriptVersionId=372138390) · [Padilla v5](https://www.kaggle.com/code/estopadilla/0-716-robust-glm-5-3-likelihood-user-prefix?scriptVersionId=371376285)
 
 ## 保留的研究
 
 - **GLM 真实似然**。同一 Native 折外输入、同一批候选和 160-token 窗口，低推理力度加段落请求的组合比旧空用户前缀提高 0.48 个百分点。同等 token 预算下，低前缀 160 token 为 0.6968，旧 320 token 为 0.6879。概率总量排序、两路都得分才融合及按剩余时间裁尾仍是基线组成。两个版本同时改变了请求与推理力度。[输入对照](../runs/glm_user_prefix_20261121/glm_user_prefix_metrics.json) · [窗口对照](../runs/glm_prefix_window_20261121/v2/glm_prefix_window_metrics.json)
-- **冻结 Native 的 GPT-5.6 族内轨迹**。外部同题差向量训练的第 6/18/30 层分段读出，在 Native＋GLM 上将 BA 从 0.6872 提至 0.6913，五折四升一降，GPT-5.6 三型号平均召回从 0.620 到 0.640。保留 GPT-5.6 单变量候选和端到端生成器，榜单增益待测。[五折指标](../runs/native_frozen_siblings_20261121/output/native_frozen_siblings.json) · [生成器](../src/ntllm/native_trajectory_deploy.py)
+- **冻结 Native 的 GPT-5.6 族内轨迹**。外部同题差向量训练的第 6/18/30 层分段读出，在 Native＋GLM 上同时开启 GPT-5.6 与 Gemini 后，BA 从 0.6872 提至 0.6913，五折四升一降。GPT-5.6 三型号平均召回从 0.620 到 0.640，贡献净改对 9 条。保留仅开启 GPT-5.6 的提交候选，完整集成收益待测。[五折指标](../runs/native_frozen_siblings_20261121/output/native_frozen_siblings.json) · [生成器](../src/ntllm/native_trajectory_deploy.py)
 - **推理开销**。Q14 高斯预拟合实测移出 484.9 秒训练前向和 9.8 秒拟合，适用性取决于评分时的权重与设备路径。Comp 的检查点选择修复保留独立候选，净效应仍需结合它占用的时间和 GLM 覆盖判断。[高斯预拟合](../src/ntllm/prefit_gauss.py) · [Comp 候选](../src/ntllm/comp_checkpoint_notebook.py)
 - **可复用的参照**。保留自训 Q8 五折原始预测、完整协议数据和通用训练入口，也保留冻结 Qwen3.5 的单条文本特征提取、分类头和预算排序，供其他读出方法对照。[Q8 五折](../runs/q8_official_20261113/five_fold_oof.json) · [Qwen3.5 读出](../src/ntllm/reader_qwen35.py)
 
-已停止的做法及实测依据见 [结题与停止原因](retired.md)。
+已停止的做法及实测依据见 [结题与停止原因](retired.md)。线上差异、误差分布和复算结果见 [2026-11-23 研究复核](status_20261123.md)。公开前沿与同题训练见 [冲榜研究](leaderboard_research_20261123.md)。完整底座逐条回放与似然复核见 [ATLAS 同底座对照](atlas_0719.md)。
