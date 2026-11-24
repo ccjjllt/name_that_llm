@@ -17,6 +17,9 @@
 
 ## 保留的研究
 
+- **同题回答的比较**。11 月 24 日，公开代码最高关联分为 0.721，榜首为 0.809。在 Sibling Odds 的 300 条 C2 回放中，用词面近邻处理型号冲突改对 3 条、改错 0 条。先恢复 Gemini 标点再应用近邻，两项相对原版合计改对 13 条、改错 0 条。词面近邻在独立 Claude 面板净增为零。Qwen3-4B 同题参照相对原版在 C2 改对 6 条、改错 10 条（BA +0.36 个百分点），在 191 条独立 Claude 数据改对 1 条、改错 2 条（BA −0.56 个百分点），相同权重也未稳定优于异题参照。此版缺乏提交依据。[实验与研究依据](peer_context_20261124.md)
+- **PROFILER 多位置打分**。双 T4 固定同一 Qwen3-4B 和训练数据。C1 选出的下一词权重是 0，多位置权重是 0.35。多位置融合相对原版 Sibling Odds 在 C2 短文改对 2 条、改错 8 条，独立 Claude 短文改对 1 条、改错 2 条。独立短文在全部非零权重下均回落。[实验与复算](profiler_20261124.md)
+
 - **GLM 真实似然**。同一 Native 折外输入、同一批候选和 160-token 窗口，低推理力度加段落请求的组合比旧空用户前缀提高 0.48 个百分点。同等 token 预算下，低前缀 160 token 为 0.6968，旧 320 token 为 0.6879。概率总量排序、两路都得分才融合及按剩余时间裁尾仍是基线组成。两个版本同时改变了请求与推理力度。[输入对照](../runs/glm_user_prefix_20261121/glm_user_prefix_metrics.json) · [窗口对照](../runs/glm_prefix_window_20261121/v2/glm_prefix_window_metrics.json)
 - **冻结 Native 的 GPT-5.6 族内轨迹**。外部同题差向量训练的第 6/18/30 层分段读出，在 Native＋GLM 上同时开启 GPT-5.6 与 Gemini 后，BA 从 0.6872 提至 0.6913，五折四升一降。GPT-5.6 三型号平均召回从 0.620 到 0.640，贡献净改对 9 条。保留仅开启 GPT-5.6 的提交候选，完整集成收益待测。[五折指标](../runs/native_frozen_siblings_20261121/output/native_frozen_siblings.json) · [生成器](../src/ntllm/native_trajectory_deploy.py)
 - **推理开销**。Q14 高斯预拟合实测移出 484.9 秒训练前向和 9.8 秒拟合，适用性取决于评分时的权重与设备路径。Comp 的检查点选择修复保留独立候选，净效应仍需结合它占用的时间和 GLM 覆盖判断。[高斯预拟合](../src/ntllm/prefit_gauss.py) · [Comp 候选](../src/ntllm/comp_checkpoint_notebook.py)
