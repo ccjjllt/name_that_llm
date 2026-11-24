@@ -1,0 +1,10 @@
+{
+  "seed": 2411,
+  "external_per_class": 1200,
+  "source_holdout_per_class": 80,
+  "max_tokens": 160,
+  "tokens_per_forward": 2048,
+  "external_epochs": 7,
+  "official_epochs": 5,
+  "weights": [0.0, 0.15, 0.35, 0.7]
+}
