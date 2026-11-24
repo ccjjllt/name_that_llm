@@ -24,3 +24,7 @@
 | 交叉熵 | 0.50 | 6 | 4 | +2 | +1.01 | −4 | +2 |
 
 C2 上事后最好的定向权重 0.50，训练增量按题重采样的描述性 95% 区间为 **−1.07 至 +4.24 个百分点**。官方适应后，两组单独在两个外部留源的 BA 分别为 0.3441 / 0.2583（定向）和 0.3471 / 0.2417（交叉熵），方向互换。定向训练与简单交叉熵在现有面板上的差异不足以支持正式提交。可复核的正收益集中在 Gemini 标点规则修复，线上效应仍待验证。
+
+## Gemini 破折号单项线上对照
+
+以 RanJeet 的 Sibling Odds v1 和原版复现分数 0.720 做对照。变体保留进入排版规则前的预测，排版结束后，只对含 `—`、原首选为 Gemini 且已被改判的正文恢复原首选。GLM 与 Fable 的上游保护参与生成这份排版前预测。原版 46 个挂载及其版本、双 T4 机型和镜像均沿用。改动集中在末段排版单元。在 798 条冻结轨迹上，实际补丁与前述实验逐条一致。正式提交的公开榜指标以 Kaggle 回执为准。[原版 Notebook](https://www.kaggle.com/code/ranjeet258/name-that-llm-sibling-odds?scriptVersionId=372780350) · [单项回放](../runs/sibling_odds_gemini_dash_20261124/local_comparison.json) · [正式评分对照](../runs/sibling_odds_gemini_dash_20261124/official_comparison.json)
