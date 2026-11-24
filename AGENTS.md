@@ -26,3 +26,12 @@
 - 使用 `uv` 管理 Python 环境和依赖，代码位于 `src/ntllm/`，实验配置位于 `configs/`。
 - 研究说明与沟通默认使用中文，代码标识符使用英文。
 - 优先增加一个可复用的小函数或脚本，确有重复需求时再抽象。
+
+## 远程 GPU
+
+- 用户已授权本轮使用 `zhuating` 的 Kaggle GPU 做研究。双 T4 能容纳模型且能在会话内跑完时优先用 Kaggle。实验运行和比赛正式提交分开操作。
+- 指定 Kaggle 账号时，通过该进程的 `KAGGLE_API_TOKEN` 注入对应凭据，用 Kaggle API 返回的用户名核对配额归属。本机实测仅设置 `KAGGLE_CONFIG_DIR` 仍可能使用默认账号。
+- 需要更大显存或 Kaggle 无法完成实验时，可使用 Colab。先执行 `export COLAB_PROXY=http://127.0.0.1:7897`。本机用户报告直连及 7900 端口会发生 TLS 错误。如果环境里已有 `HTTPS_PROXY` 或 `HTTP_PROXY`，在调用 `colabx` 时也将两者设为 `"$COLAB_PROXY"`。
+- 用 `colab-accounts` 查看账号，`colab-use ccjjllt0` 切换默认账号，也可以在单条命令前指定 `COLAB_ACCOUNT=rainer`。用户说明 rainer 有 Google AI Ultra 额度，启用高配前核对实际余额和机型。
+- 用 `colabx new -s gpu1 --gpu T4` 创建会话，`colabx exec -s gpu1 -f <本项目脚本> --timeout 1800` 执行，完成后用相同账号执行 `colabx stop -s gpu1`。可经桌面 Google Drive 同步数据，在 Colab 侧挂载后读取。权重、断点和逐条预测用持久目录保存，免费 T4 会话可能在数小时内回收。
+- 凭据只在任务确实需要时从账号对应的本机凭据文件或远端 secret 注入。Notebook、Drive 同步目录和日志中均不保存凭据。
