@@ -64,20 +64,20 @@ def freeze(archive, output):
     return visible
 
 
-def build(queries, output):
-    metadata = json.loads((DENNIS / 'kernel-metadata.json').read_text())
-    original = json.loads((DENNIS / metadata['code_file']).read_text())
+def prepare_trace(queries, source_dir=DENNIS):
+    metadata = json.loads((source_dir / 'kernel-metadata.json').read_text())
+    original = json.loads((source_dir / metadata['code_file']).read_text())
     # Reuse the exact Dennis trace instrumentation and replace only query setup.
     notebook = prepare_notebook(original, '')
     payload = base64.b64encode(gzip.compress(queries.to_csv(index=False).encode(), mtime=0)).decode()
     notebook['cells'][0] = cell(
         "import base64, gzip\nfrom pathlib import Path\n"
-        "Path('/kaggle/working/gen003_queries.csv').write_bytes(gzip.decompress(base64.b64decode("
+        "Path('/kaggle/working/frozen_queries.csv').write_bytes(gzip.decompress(base64.b64decode("
         + repr(payload) + ")))\n")
     setup = notebook['cells'][cell_index(notebook, 'import glob\n')]
     s = source(setup)
     first, last = s.index('from atlas_public_probe import'), s.index('query_data = Path(')
-    setup['source'] = s[:first] + """probe = pd.read_csv('/kaggle/working/gen003_queries.csv', dtype={'id': str})
+    setup['source'] = s[:first] + """probe = pd.read_csv('/kaggle/working/frozen_queries.csv', dtype={'id': str})
 assert list(probe) == ['id', 'text'] and probe.id.is_unique
 proof = Path('/kaggle/working/atlas_baseline')
 proof.mkdir(exist_ok=True)
@@ -111,8 +111,12 @@ restore = ((sibling != pre) & np.char.startswith(pre.astype(str), 'gemini-')
 pd.DataFrame(dict(id=trace['ids'], dennis=dennis, sibling_odds=sibling, pre_typography=pre,
                   dash_only=np.where(restore, pre, sibling))).to_parquet(proof / 'frozen_predictions.parquet', index=False)
 """))
-    # Keep only the verified parent mounts. None of the GEN003 source dataset,
-    # full four-answer groups, local archives or labels are attached here.
+    return metadata, notebook
+
+
+def build(queries, output):
+    metadata, notebook = prepare_trace(queries)
+    # Keep only the verified parent mounts. The labels stay outside the trace.
     metadata.pop('id_no', None)
     metadata.update(id='zhuating/ntl-gen003-sparse-trace', title='NTL GEN003 Sparse Trace', is_private=True,
                     enable_gpu=True, enable_internet=False, docker_image_pinning_type='original')
