@@ -28,3 +28,5 @@ C2 上事后最好的定向权重 0.50，训练增量按题重采样的描述性
 ## Gemini 破折号单项线上对照
 
 以 RanJeet 的 Sibling Odds v1 和原版复现分数 0.720 做对照。变体保留进入排版规则前的预测，排版结束后，只对含 `—`、原首选为 Gemini 且已被改判的正文恢复原首选。GLM 与 Fable 的上游保护参与生成这份排版前预测。原版 46 个挂载及其版本、双 T4 机型和镜像均沿用。改动集中在末段排版单元。在 798 条冻结轨迹上，实际补丁与前述实验逐条一致。正式提交的公开榜指标以 Kaggle 回执为准。[原版 Notebook](https://www.kaggle.com/code/ranjeet258/name-that-llm-sibling-odds?scriptVersionId=372780350) · [单项回放](../runs/sibling_odds_gemini_dash_20261124/local_comparison.json) · [正式评分对照](../runs/sibling_odds_gemini_dash_20261124/official_comparison.json)
+
+11 月 25 日确认，破折号修复提交 `58813845` 和原版提交 `58768811` 的公榜均显示 **0.720**，显示差值 **+0.000**。zayd 镜像复现 `58816493` 得 **0.721**，其执行代码、挂载版本和镜像与 RanJeet 原版相同。[三条正式回执](../runs/current_frontier_20261124/official_comparison.json)

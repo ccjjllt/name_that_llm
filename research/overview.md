@@ -6,7 +6,9 @@
 
 | 本队提交 | 公开榜 BA | 记录 |
 |---|---:|---|
-| Sibling Odds v1 原样复现 | **0.720** | [58768811](../runs/public_0720_sibling_odds_20261123/submission.json) |
+| zayd Sibling Odds v1 镜像原样复现 | **0.721** | [58816493](../runs/current_frontier_20261124/official_comparison.json) |
+| RanJeet Sibling Odds v1 原样复现 | 0.720 | [58768811](../runs/public_0720_sibling_odds_20261123/submission.json) |
+| RanJeet Sibling Odds v1 + Gemini 破折号修复 | 0.720 | [58813845](../runs/current_frontier_20261124/official_comparison.json) |
 | Dennis Guarded Fable v1 原样复现 | 0.718 | [58754662](../runs/atlas_0719_20261123/official_comparison.json) |
 | Dennis Guarded Fable v1 + ATLAS | 0.718 | [58768879](../runs/atlas_0719_20261123/official_comparison.json) |
 | Mirza v5 原样复现 | 0.717 | [58692158](../runs/public_0717_mirza_20261122/submission.json) |
