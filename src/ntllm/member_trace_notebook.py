@@ -164,11 +164,16 @@ _member_trace = MemberTrace(test.id, LABELS)
     return text.rstrip() + "\n\n_member_trace.save('comp')\n"
 
 
-def build(queries, output, source_dir, pinned):
-    build_frozen_trace(queries, output, source_dir, kernel=KERNEL, title='NTL Sibling Odds Member Trace',
-                       probe_name='member evidence', pinned=pinned)
+def build(queries, output, source_dir, pinned, *, kernel=KERNEL, title='NTL Sibling Odds Member Trace',
+          probe_name='member evidence', payload=None, extra_kernel_sources=()):
+    build_frozen_trace(queries, output, source_dir, kernel=kernel, title=title,
+                       probe_name=probe_name, pinned=pinned)
     metadata = json.loads((output / 'kernel-metadata.json').read_text())
     notebook = json.loads((output / metadata['code_file']).read_text())
+    if payload is not None:
+        compile(payload, '<member trace input>', 'exec')
+        notebook['cells'][0] = cell(payload)
+    metadata['kernel_sources'].extend(extra_kernel_sources)
     for path, instrument in (('infer.py', instrument_infer), ('comp_stack.py', instrument_comp)):
         target = notebook['cells'][cell_index(notebook, f'%%writefile {path}')]
         traced = instrument(source(target))

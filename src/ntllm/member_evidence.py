@@ -82,6 +82,9 @@ def feature_tables(trace, baseline, members, coverage, short):
                      same_family & short[:, None], base_gap.clip(-15., 0)]
     for key in STAGES:
         base_features.extend(features[key])
+    stages = np.stack(base_features, axis=2)
+    if not members:
+        return {'stages': stages}, stage, ranks, rankings
     unpacked = [item for key in members for item in features[key]]
     top_count = np.stack([votes[key] for key in members]).sum(0)
     for group in sorted({key.split('__', 1)[0] for key in members}):
@@ -89,7 +92,7 @@ def feature_tables(trace, baseline, members, coverage, short):
         unpacked.append(np.stack([votes[key] for key in keys]).mean(0))
     unpacked.extend([top_count, top_count * short[:, None],
                      np.minimum.reduce([ranks[key] for key in members]) <= 2])
-    return {'stages': np.stack(base_features, axis=2), 'members': np.stack(base_features + unpacked, axis=2)}, stage, ranks, rankings
+    return {'stages': stages, 'members': np.stack(base_features + unpacked, axis=2)}, stage, ranks, rankings
 
 
 def fit_ranker(features, anchor, true_codes, fit_rows):
