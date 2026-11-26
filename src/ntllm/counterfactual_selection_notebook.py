@@ -14,22 +14,7 @@ BASE = ['zhuating/ntl-sibling-odds-member-trace/1', 'zhuating/ntl-0719-public-de
         'zhuating/ntl-heldout-source-audit/2']
 
 
-def build(output, heldout, guard=False, deployment=False, typography=False, readers=False, family_factored=False):
-    modules = ('counterfactual_selection', 'counterfactual_selection_audit', 'peer_context_report',
-               'heldout_source_audit', 'member_evidence', 'member_evidence_transfer',
-               'sibling_odds_replay', 'provenance_family_replay')
-    if guard or deployment or readers or family_factored:
-        modules += ('counterfactual_native_guard', 'glm_prefix_response_replay')
-    if guard:
-        modules += ('counterfactual_guard_audit',)
-    if deployment:
-        modules += ('counterfactual_deployment', 'counterfactual_deployment_audit')
-    if typography:
-        modules += ('typography_transfer',)
-    if readers:
-        modules += ('reader_candidate_audit', 'reader_transfer')
-    if family_factored:
-        modules += ('counterfactual_deployment', 'family_factored_stage', 'family_factored_audit')
+def setup_cell(modules):
     setup = ("from pathlib import Path\nimport base64\n"
              "Path('ntllm').mkdir(exist_ok=True)\nPath('ntllm/__init__.py').touch()\n")
     for module in modules:
@@ -47,7 +32,31 @@ def build(output, heldout, guard=False, deployment=False, typography=False, read
         payload = base64.b64encode(value).decode()
         setup += f"Path({target!r}).parent.mkdir(parents=True, exist_ok=True)\n"
         setup += f"Path({target!r}).write_bytes(base64.b64decode({payload!r}))\n"
+    return setup
 
+
+def build(output, heldout, guard=False, deployment=False, typography=False, readers=False, family_factored=False,
+          support_censored=False):
+    score_study = ('family_factored_audit' if family_factored
+                   else 'support_censored_selector' if support_censored else '')
+    modules = ('counterfactual_selection', 'counterfactual_selection_audit', 'peer_context_report',
+               'heldout_source_audit', 'member_evidence', 'member_evidence_transfer',
+               'sibling_odds_replay', 'provenance_family_replay')
+    if guard or deployment or readers or score_study:
+        modules += ('counterfactual_native_guard', 'glm_prefix_response_replay')
+    if guard:
+        modules += ('counterfactual_guard_audit',)
+    if deployment:
+        modules += ('counterfactual_deployment', 'counterfactual_deployment_audit')
+    if typography:
+        modules += ('typography_transfer',)
+    if readers:
+        modules += ('reader_candidate_audit', 'reader_transfer')
+    if score_study:
+        modules += ('counterfactual_deployment', score_study)
+    if family_factored:
+        modules += ('family_factored_stage',)
+    setup = setup_cell(modules)
     audit_module = 'counterfactual_guard_audit' if guard else 'counterfactual_selection_audit'
     working = 'counterfactual_guard' if guard else 'counterfactual_selection'
     base_reference = 'counterfactual-selection' if guard else None
@@ -73,8 +82,8 @@ def build(output, heldout, guard=False, deployment=False, typography=False, read
         if heldout:
             extras += """        heldout=source('ntl-provenance-readers-heldout', 'provenance_balanced_logits.parquet'),
 """
-    if family_factored:
-        audit_module = working = 'family_factored_audit'
+    if score_study:
+        audit_module = working = score_study
         base_reference = 'counterfactual-deployment-audit'
         reference_file = 'stage_multisource.json'
     reference = (f"        reference=source({base_reference!r}, {reference_file!r}) / {reference_file!r},\n"
@@ -115,6 +124,8 @@ with threadpool_limits(limits=2, user_api='blas'):
             pins.append('zhuating/ntl-provenance-readers-heldout/1')
     if family_factored:
         name = 'ntl-family-factored-stage'
+    if support_censored:
+        name = 'ntl-support-censored-selector'
     if base_reference:
         pins += [f'zhuating/{base_reference}/1']
     if heldout:
@@ -139,5 +150,7 @@ if __name__ == '__main__':
     mode.add_argument('--typography', action='store_true')
     mode.add_argument('--readers', action='store_true')
     mode.add_argument('--family-factored', action='store_true')
+    mode.add_argument('--support-censored', action='store_true')
     args = parser.parse_args()
-    build(args.output, args.heldout, args.guard, args.deployment, args.typography, args.readers, args.family_factored)
+    build(args.output, args.heldout, args.guard, args.deployment, args.typography, args.readers, args.family_factored,
+          args.support_censored)
