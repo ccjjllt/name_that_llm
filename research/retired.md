@@ -1,20 +1,23 @@
-# 结题与停止原因
+# 已停止的研究
 
-除标明公开榜的记录外，分数为本项目在各自固定输入上的 prompt 五折 BA。AUC 与可修正上限用于诊断。不同底座的绝对分数分别解读。
+改判数记为改对／改错，BA 差值用百分点。每项使用其原实验的底座和数据。C2 反复参与探索且缺少真 GLM 与 Fable，提交判断优先看独立留源及正式配对分数。
 
-| 已停止的做法 | 留下的结论与停止原因 |
-|---|---|
-| 自训 Q8 替换旧集成的 q8v5 槽位 | 外部更新从 2,000 到 26,484，再按折做 192 次官方更新，plain 从 0.57307 到 0.64201、centered 从 0.62682 到 0.68831、固定三分支从 0.63902 到 0.69166。六件套替换的公开榜为 **0.684 → 0.681**（58396783），单成员收益未传导到这个低份额槽位。五折与部署件另有重跑，权重哈希不同。全量部署件没有留出数据。[五折指标](../runs/q8_official_20261113/five_fold_oof.json) |
-| Q8 数据扩容先导与阶段矩阵 | 2,000 更新下扩大池后 plain 0.55566 → 0.57307，入池、实际曝光及 centered 伙伴供给同时变化，三分支增量的题组区间含零。完整日程只完成 class/on-on 一臂，CPU 先导不足以确定 class/global 或阶段开关优劣。随槽位替换结束，停掉批量消融。[先导汇总](../runs/scale_research_20261105/analysis_v2/result_summary.json) |
-| Q8 固定关系来源替换 | 每臂 119,616 条，替换 2,955 个 plain-only 槽，其中 2,925 条换来源。对照同时涉及来源和生成协议，Qwen 两臂结果缺失，结束该准备线。扩展池中复合协议未知为 86.44%，其中生成状态未知占全池 52.90%，两种口径需区分。[替换范围](../runs/q8_source_20261107/replacement_scope.json) · [证据报告](../data/q8_protocol/protocol_evidence_report.json) |
-| Q8 内层选权、bagging 与压力布局 | 24 个开发 prompt 上权重重选率约 31–52%。温度改善 NLL，bagging 有时降低选择敏感性，BA 随稀疏性及类别比例方向波动，未稳定优于固定配方。近均衡面板上的类别排斥增益不可外推。可观测性与 live Gaussian 的独立探针随协议冻结结束，后者由共用评估视图覆盖。[校准](../runs/auxiliary_adaptation_20261106/fusion/calibrated_cpu_v2/summary.json) · [重采样](../runs/fusion_robustness_20261107/stability/summary.json) |
-| TF-IDF 族内与跨族重排 | 对 Q8 折外分数的小权重重排最多 +0.33 / +0.44 个百分点。官方训练侧交叉拟合的词面判别器完全接管族内决策后，0.69166 降到 0.46386（字符）或 0.43015（词）。Kimi 词面 AUC 外池迁移 0.767、官方域内 0.776，诊断未发现明显迁移损失，现有词面分数不足以救回跨族误判。[族内](../runs/kaggle_a_20261116/output/results_a.json) · [跨族](../runs/kaggle_a2_20261116/output/results_a2.json) · [Kimi](../runs/kaggle_c_20261116/output/results_c.json) |
-| 改训 Native 与旧风格专家 | 8B 续训 0.6516 → 0.6305，4B 独立仅 0.3571；外部同题风格原型融合全量 +0.07 个百分点，两次稀疏抽样方向相反。旧跨族轨迹的公开榜与同源原版均为 0.709（58651182 / 58650152）。保留冻结 Native 的独立 GPT-5.6 路线。[8B](../runs/native8_style_20261121/native_adapt_metrics.json) · [4B](../runs/native4_style_20261121/v2/native4b.json) · [风格原型](../runs/style_readout_20261121/v3/style_results.json) |
-| Claude、Gemini 的专项重排 | Claude 短片段功能词头全量净改对 1 条，Fable 短文召回持平。Gemini 句位余弦为 0.68684，Qwen 尾段差分为 0.68388，均低于共同基线 0.68721；简单风格汇总略升到 0.68832，五折方向混合。[Claude](../runs/claude_anchor_pairs_20261122/output/claude_anchor_pairs_metrics.json) · [句位](../runs/gemini_sentence_order_20261122/output/gemini_sentence_order.json) · [尾段](../runs/gemini_tail_contrast_20261122/output/gemini_tail_contrast.json) |
-| 通用与作者条件似然 | 通用 Qwen3-4B 似然 15% 融合为 0.6516 → 0.6535，更高权重退化。1.7B 作者条件似然在首选与候选的成对 AUC 为 0.4676，原分差为 0.6197；融合及作者偏置修正均降分。路由诊断给出约 +11.41 个百分点的完美改判上限，实测判别器未利用这部分空间。[通用似然](../runs/likelihood_expert_20261121/likelihood_metrics.json) · [条件似然](../runs/source_likelihood_20261121/readout/source_likelihood_readout.json) · [可达性](../runs/source_routing_20261121/source_routing.json) |
-| GLM 改排序、加校准或调整字形交接 | 旧 320-token 自适应排序与保留后验组合的公开榜 **0.709 → 0.701**（58650152 / 58650603）。新前缀上学习排序同预算持平，校准净改对约 1 条，选择性字形交接零改判。同 587 条候选下，128／96／64 token 的 BA 分别为 0.69460／0.68978／0.67680，基线 160 token 为 0.69683。[学习排序](../runs/glm_prefix_learned_routing_20261122/v1/glm_prefix_learned_routing_metrics.json) · [窗口](../runs/glm_prefix_window_20261121/v2/glm_prefix_window_metrics.json) |
-| 类别比例修正 | Sinkhorn 的小幅收益随布局变化，末段频率修正在缺三类时平均下降 0.73 个百分点。暂停额外修正。[类别比例对照](../runs/class_prior_transfer_20261121/v2/class_prior_transfer.json) |
-| Kimi-K3 分段真实似然 | 空格与空 think＋response 两路共约两小时。正文 token 差分 AUC 0.6137，融合 0.68721 → 0.68832，净改对 3 条，收益不足以覆盖开销。READER 回放中只有 25/63 条 Kimi 漏判可重排，其中 13 条首选 GPT-5.5。[似然配对](../runs/kimi_prefix_pair_20261121/v2/kimi_prefix_pair_metrics.json) · [误差范围](../runs/glm_reader_kimi_pair_20261122/v1/glm_reader_kimi_pair_metrics.json) |
-| Qwen3.5 READER ＋ Fable 恢复的提交配方 | 第 18 层 DC＋AC 全类读出与恢复规则在 Native 折外回放中从 0.69124 提至 0.70313，低分差 50% 同为 0.70313。两套正式提交均为 **0.707**，Padilla v5 原版为 0.716；组合对照无法分解两项改动。族内配对及固定族质量降低折外 BA，末 token 和多层平均的微小变化缺乏一致性。停止该提交配方，保留通用读出。[回放](../runs/glm_reader_apex_ab_20261122/v1/glm_reader_apex_ab_metrics.json) · [全量结果](../runs/l0716_reader_qwen35_20261122/competition_submission.json) · [50% 结果](../runs/l0716_reader_qwen35_margin50_20261122/competition_submission.json) |
+| 方向 | 实测结论与停止原因 |
+| --- | --- |
+| ATLAS 候选对似然 | Dennis 同底座 C2 仅 1／0，另一次改判仍错。正式原版和 ATLAS 均为 0.718（58754662／58768879），候选覆盖及线上增量有限。 |
+| Q4 逐词指纹、18 类和定向 LoRA | Q4 增强单头的官方折外 BA 40.53% → 41.90%，两组外部留源下降。Q4 与定向 LoRA 的融合权重均由 C1 选为零。单头分数上涨未传导到现有集成。 |
+| 4B 同题参照与同题分配 | 同题参照相对原版 C2 为 6／10，BA +0.36，独立 Claude 191 篇为 1／2，BA −0.56，同题对异题优势不稳定。词面近邻在 C2 为 3／0，在独立 Claude 净增为零。正文联合解码在 C2 为 3／4，BA −1.03，真实题组也仅 +0.05。 |
+| PROFILER 多位置分数 | 同 4B、同输入，多位置提高独立分类能力，接回同一底座后 C2 短文 2／8、BA −1.48，独立 Claude 短文 1／2、BA −0.88。独立短文在每个非零权重下回落。 |
+| Terra 与 GPT‑5.5 候选对训练 | 同数据与普通分类对照，C1 两臂均选零权重，C2 和留源短文均 0／0。强开后 C2 两臂各多错 1 篇，176 篇独立留源也低于原版。 |
+| Kimi／GLM 跨档位与 Flash 定向复核 | 跨档位和普通两臂在 72 篇专家留源短文均为 0／7，该批正文已进入底座语料。仅复核 Flash 的专家在 191 篇新留源为 1／0（+0.49），C2 短文 0／0。73 个 Kimi 错例只有 5 个原判 Flash，进一步调阈值空间有限。 |
+| 来源均衡、风格编码与位置读出 | 来源均衡 4B 独立 Claude 单头 BA 45.79% → 52.85%，同底座 Claude 限制在 GEN003 短文误伤 2 篇。StyleDistance、题目方向投影、混合风格分布、等长位置与梯度加权均缺乏跨面板的稳定改判收益。 |
+| GPT 同题中心化和 Gemini 同请求配对 | GPT 中心化与普通头在严格留题短文救回同一篇，C2 强开无 BA 增量。Gemini 两臂数据相同，配对比 CE 在 895 篇留源为 1／0、BA +0.10，短文持平，两臂接回后均降低 C2 BA。 |
+| 广覆盖固定融合和成员重排 | 三阶段前三与成员前二覆盖独立面板 164／168 个错例。缓存读出在官方折外能补 70 个前三候选，固定融合 BA 仍下降。成员可靠性及族内分层加权也未兑现覆盖上限。冻结选择器仍用于前瞻留源复核。 |
+| 包含排版放行的末段规则 | Gemini 破折号补丁在历史回放有正增量，两条同源提交均为 0.720。限制于一致候选的剩余规则在独立短文触发稀少，扩大放行及缺类校准缺乏稳定收益。 |
+| GLM 扩覆盖、Flash 级联和重学习调度 | PB115 增加约 50% 位置预算仅 +0.11，双倍及以上回落。Flash 优先级联 19／26、BA −0.26，同预算学习调度 −0.037。真实归档尾部恢复 GLM／Flash／Fable 为 0／0，留源 Flash 短文支持不足。 |
+| 加重 GSQ 27B 与旧似然专家 | 去掉 0.03 的 GSQ 在 895 篇为 1／0，短文 0／0，提高权重掉分。Kimi 原生似然双前缀约两小时，折外 +0.11。低权重通用似然增量小，作者条件似然未超过底座原分差。 |
+| Qwen3.5 READER 与无阈值 Fable 恢复 | Native 回放 BA 0.69124 → 0.70313，两版正式提交均为 0.707，Padilla 原版 0.716。组合及范围缩减均未改善评分；通用读出保留。 |
+| 自训 Q8 替换旧集成槽位 | 独立五折 plain 0.64201、centered 0.68831、三分支 0.69166，权重替换的公开榜为 0.684 → 0.681（58396783）。停止替换和配套扩容矩阵，移除五份折内部署权重，保留五折预测及一份无留出的全量适配器。 |
+| 早期 Native 续训、词面重排和类别先验 | Native 8B 续训 0.6516 → 0.6305，词面分类完全接管族内导致大幅退化，类别比例修正在缺类布局下降。旧校准和字形交接的微小收益随来源、题组密度和类比例改变。 |
 
-保留 Q8 本地六件套作为权重参照。项目记录中的重跑导出位于私有 Kaggle Notebook `qingyu1232/ntl-q8v5-export-q`，当前凭据无法读取。另存的 full 件与本地六件套中的 full 件 SHA-256 一致，已去重。
+已跟踪的历史研究文档及脚本可在清理前的 Git 版本 `04694a4` 中查看。复用方向和保留证据见 [研究概况](overview.md)。
